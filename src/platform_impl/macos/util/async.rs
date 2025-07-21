@@ -9,6 +9,7 @@ use std::{
 
 use core_graphics::base::CGFloat;
 use dispatch::Queue;
+use dpi::Position;
 use objc2::{rc::autoreleasepool, Message};
 use objc2_app_kit::{NSScreen, NSView, NSWindow, NSWindowStyleMask};
 use objc2_foundation::{MainThreadMarker, NSPoint, NSSize, NSString};
@@ -17,6 +18,7 @@ use crate::{
   dpi::LogicalSize,
   platform_impl::platform::{
     ffi::{self, id, NO, YES},
+    view::inset_traffic_lights,
     window::SharedState,
   },
 };
@@ -219,11 +221,21 @@ pub unsafe fn make_key_and_order_front_sync(ns_window: &NSWindow) {
 // `setTitle:` isn't thread-safe. Calling it from another thread invalidates the
 // window drag regions, which throws an exception when not done in the main
 // thread
-pub unsafe fn set_title_async(ns_window: &NSWindow, title: String) {
+pub unsafe fn set_title_async(
+  ns_window: &NSWindow,
+  title: String,
+  traffic_lights_position: Option<Position>,
+) {
   let ns_window = MainThreadSafe(ns_window.retain());
   Queue::main().exec_async(move || {
     let title = NSString::from_str(&title);
     ns_window.setTitle(&title);
+    if let Some(position) = traffic_lights_position {
+      inset_traffic_lights(
+        &ns_window,
+        position.to_logical(ns_window.backingScaleFactor()),
+      );
+    }
   });
 }
 

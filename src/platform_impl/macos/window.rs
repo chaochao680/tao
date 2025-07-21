@@ -17,7 +17,8 @@ use std::{
 
 use crate::{
   dpi::{
-    LogicalPosition, LogicalSize, PhysicalPosition, PhysicalSize, Position, Size, Size::Logical,
+    LogicalPosition, LogicalSize, PhysicalPosition, PhysicalSize, Position,
+    Size::{self, Logical},
   },
   error::{ExternalError, NotSupportedError, OsError as RootOsError},
   icon::Icon,
@@ -29,7 +30,7 @@ use crate::{
       ffi,
       monitor::{self, MonitorHandle, VideoMode},
       util::{self, IdRef},
-      view::{self, new_view, CursorState},
+      view::{self, inset_traffic_lights, new_view, CursorState},
       window_delegate::new_delegate,
       OsError,
     },
@@ -459,6 +460,7 @@ pub struct SharedState {
   save_presentation_opts: Option<NSApplicationPresentationOptions>,
   pub saved_desktop_display_mode: Option<(CGDisplay, CGDisplayMode)>,
   pub current_theme: Theme,
+  pub traffic_lights_position: Option<Position>,
 }
 
 impl SharedState {
@@ -600,6 +602,8 @@ impl UnownedWindow {
       }
     }
 
+    window.shared_state.lock().unwrap().traffic_lights_position = pl_attribs.traffic_light_inset;
+
     let delegate = new_delegate(&window, fullscreen.is_some());
 
     // Set fullscreen mode after we setup everything
@@ -639,7 +643,11 @@ impl UnownedWindow {
 
   pub fn set_title(&self, title: &str) {
     unsafe {
-      util::set_title_async(&self.ns_window, title.to_string());
+      util::set_title_async(
+        &self.ns_window,
+        title.to_string(),
+        self.shared_state.lock().unwrap().traffic_lights_position,
+      );
     }
   }
 
@@ -1490,6 +1498,11 @@ impl UnownedWindow {
     set_ns_theme(theme);
     let mut state = self.shared_state.lock().unwrap();
     state.current_theme = theme.unwrap_or_else(get_ns_theme);
+    // if let Some(position) = state.traffic_lights_position {
+    //   unsafe {
+    //     inset_traffic_lights(&self.ns_window, position.to_logical(self.scale_factor()));
+    //   }
+    // }
   }
 
   pub fn set_content_protection(&self, enabled: bool) {
@@ -1636,6 +1649,9 @@ impl WindowExtMacOS for UnownedWindow {
   #[inline]
   fn set_traffic_light_inset<P: Into<Position>>(&self, position: P) {
     let position: Position = position.into();
+    {
+      self.shared_state.lock().unwrap().traffic_lights_position = Some(position)
+    }
     #[allow(deprecated)] // TODO: Use define_class!
     unsafe {
       let state_ptr: *mut c_void = *(self.ns_view).get_ivar("taoState");
