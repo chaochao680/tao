@@ -51,7 +51,7 @@ pub struct KeyEventExtra {}
 pub struct EventLoop<T: 'static> {
   pub(crate) openharmony_app: OpenHarmonyApp,
   window_target: event_loop::EventLoopWindowTarget<T>,
-  cause: StartCause,
+  _cause: StartCause,
   user_events_sender: mpsc::Sender<T>,
   user_events_receiver: PeekableReceiver<T>,
   event_loop: RefCell<Option<Box<dyn FnMut(event::Event<T>)>>>,
@@ -84,13 +84,13 @@ impl<T: 'static> EventLoop<T> {
       window_target: event_loop::EventLoopWindowTarget {
         p: EventLoopWindowTarget {
           app: openharmony_app.clone(),
-          control_flow: Cell::new(ControlFlow::default()),
+          _control_flow: Cell::new(ControlFlow::default()),
           exit: Cell::new(false),
           _marker: PhantomData,
         },
         _marker: PhantomData,
       },
-      cause: StartCause::Init,
+      _cause: StartCause::Init,
       user_events_sender,
       user_events_receiver: PeekableReceiver::from_recv(user_events_receiver),
       event_loop: RefCell::new(None),
@@ -103,6 +103,7 @@ impl<T: 'static> EventLoop<T> {
 
   // TODO: For input event, we need some real examples to test it
   fn handle_input_event(&self, event: &InputEvent) {
+    #[allow(unreachable_patterns)]
     match event {
       InputEvent::TouchEvent(motion_event) => {
         let window_id = window::WindowId(WindowId);
@@ -242,7 +243,7 @@ impl<T: 'static> EventLoop<T> {
           KeyboardStatus::Hide => {
             if let Some(ref mut h) = *self.event_loop.borrow_mut() {
               // Mock keyboard input event that make sure egui can receive the event and trigger onblur event
-              [ElementState::Pressed, ElementState::Released].map(|state| {
+              let _ = [ElementState::Pressed, ElementState::Released].map(|state| {
                 h(event::Event::WindowEvent {
                   window_id: window::WindowId(WindowId),
                   event: event::WindowEvent::KeyboardInput {
@@ -466,7 +467,7 @@ impl<T: 'static> Clone for EventLoopProxy<T> {
 #[derive(Clone)]
 pub struct EventLoopWindowTarget<T: 'static> {
   pub(crate) app: OpenHarmonyApp,
-  control_flow: Cell<ControlFlow>,
+  _control_flow: Cell<ControlFlow>,
   exit: Cell<bool>,
   _marker: std::marker::PhantomData<T>,
 }
