@@ -352,7 +352,7 @@ impl<T: 'static> EventLoop<T> {
           if let Some(ref mut h) = *self.event_loop.borrow_mut() {
             h(event::Event::WindowEvent {
               window_id: window::WindowId(WindowId),
-              event: event::WindowEvent::Focused(true),
+              event: event::WindowEvent::Focused(false),
             });
           }
         }
@@ -626,8 +626,7 @@ impl Window {
   }
 
   pub fn is_focused(&self) -> bool {
-    log::warn!("`Window::is_focused` is ignored on OpenHarmony");
-    false
+    HAS_FOCUS.load(Ordering::Relaxed)
   }
 
   pub fn is_always_on_top(&self) -> bool {
