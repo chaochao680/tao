@@ -583,12 +583,19 @@ impl Window {
     v
   }
 
-  pub fn inner_position(&self) -> Result<PhysicalPosition<i32>, error::NotSupportedError> {
-    Err(error::NotSupportedError::new())
+pub fn inner_position(&self) -> Result<PhysicalPosition<i32>, error::NotSupportedError> {
+    let content = self.app.content_rect();
+    let window = self.app.window_rect();
+    // inner_position = content area position on screen
+    // = window position + content offset relative to window
+    // content_rect.left/top is XComponent offset relative to its parent container
+    // In OHOS: Screen -> Window -> Container -> XComponent
+    Ok(PhysicalPosition::new(window.left + content.left, window.top + content.top))
   }
 
   pub fn inner_size(&self) -> PhysicalSize<u32> {
-    self.outer_size()
+    let rect = self.app.content_rect();
+    PhysicalSize::new(rect.width as _, rect.height as _)
   }
 
   pub fn set_inner_size(&self, _size: Size) {
@@ -597,7 +604,8 @@ impl Window {
   pub fn set_inner_size_constraints(&self, _: WindowSizeConstraints) {}
 
   pub fn outer_position(&self) -> Result<PhysicalPosition<i32>, error::NotSupportedError> {
-    Err(error::NotSupportedError::new())
+    let rect = self.app.window_rect();
+    Ok(PhysicalPosition::new(rect.left, rect.top))
   }
 
   pub fn set_outer_position(&self, _position: Position) {
@@ -605,7 +613,15 @@ impl Window {
   }
 
   pub fn outer_size(&self) -> PhysicalSize<u32> {
-    MonitorHandle::new(self.app.clone()).size()
+    let window = self.app.window_rect();
+    // window_rect is set by ArkTS callback, may be (0,0,0,0) initially
+    // fallback to content_rect if not yet initialized
+    if window.width > 0 && window.height > 0 {
+      PhysicalSize::new(window.width as _, window.height as _)
+    } else {
+      let content = self.app.content_rect();
+      PhysicalSize::new(content.width as _, content.height as _)
+    }
   }
 
   pub fn set_min_inner_size(&self, _: Option<Size>) {}
