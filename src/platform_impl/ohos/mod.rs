@@ -4,9 +4,12 @@ use std::hash::Hash;
 use std::marker::PhantomData;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
+use std::ptr::NonNull;
+use std::ffi::c_void;
 
 use keycodes::{to_location, to_logical};
 use openharmony_ability::xcomponent::{Action, TouchEvent};
+use openharmony_ability::window::create_os_window;
 
 use openharmony_ability::{
   ime::KeyboardStatus, Configuration, Event as MainEvent, ImeEvent, InputEvent, OpenHarmonyApp,
@@ -541,23 +544,56 @@ impl DeviceId {
   }
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct PlatformSpecificWindowBuilderAttributes;
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct PlatformSpecificWindowBuilderAttributes {
+    pub label: Option<String>,
+}
 
 pub(crate) struct Window {
   app: OpenHarmonyApp,
+  window_id: Option<i64>,
+}
+
+enum OHOSWindowType {
+  TypeApp = 0,
+  TypeSystemAlert = 1,
+  TypeFloat = 8,
+  TypeDialog = 16,
+  TypeMain = 32
 }
 
 impl Window {
   pub(crate) fn new<T: 'static>(
     el: &EventLoopWindowTarget<T>,
-    _window_attrs: window::WindowAttributes,
-    _: PlatformSpecificWindowBuilderAttributes,
+    window_attrs: window::WindowAttributes,
+    pl_attrs: PlatformSpecificWindowBuilderAttributes,
   ) -> Result<Self, error::OsError> {
-    // FIXME this ignores requested window attributes
+    // 主窗口的 label 固定为 "main"。
+    // 如果是主窗口，不创建新的 OS 窗口，而是复用已有的主窗口容器 (DefaultXComponent)。
+    // 此时 window_id 为 None，wry 会走 Path 1 (WebViewBuilder)。
+    let is_main_window = pl_attrs.label.as_deref() == Some("main");
+    log::info!("Window:new label: {:?}, title: {:?}", pl_attrs.label, window_attrs.title);
+
+    let window_type = if is_main_window {
+      // 主窗口不需要 window_type
+      0
+    } else {
+      // 子窗口使用 Float 类型
+      OHOSWindowType::TypeFloat as i32
+    };
+
+    let window_id = if is_main_window {
+      Some(0)
+    } else {
+      // 子窗口需要调用 create_os_window 创建新的 OS 级窗口。
+      // 此时 window_id 为 Some(id)，wry 会走 Path 2 (load_url)。
+      let label = pl_attrs.label.clone().unwrap_or_else(|| window_attrs.title.clone());
+      create_os_window(label, window_type).ok()
+    };
 
     Ok(Self {
       app: el.app.clone(),
+      window_id,
     })
   }
 
@@ -817,6 +853,10 @@ pub fn inner_position(&self) -> Result<PhysicalPosition<i32>, error::NotSupporte
 
   pub fn content_rect(&self) -> Rect {
     self.app.content_rect()
+  }
+
+  pub fn window_id(&self) -> Option<i64> {
+    self.window_id
   }
 
   pub fn current_monitor(&self) -> Option<monitor::MonitorHandle> {

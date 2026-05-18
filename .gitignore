@@ -10,3 +10,5 @@ rls/
 *.js
 #*#
 .DS_Store
+.omc
+Cargo.lock
