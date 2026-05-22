@@ -13,7 +13,7 @@
 #![cfg(target_env = "ohos")]
 
 use crate::event_loop::{EventLoop, EventLoopBuilder};
-use crate::window::{Window, WindowAttributes};
+use crate::window::{Window, WindowAttributes, WindowBuilder};
 use openharmony_ability::{Configuration, OpenHarmonyApp, Rect};
 
 /// Additional methods on [`EventLoop`] that are specific to OpenHarmony.
@@ -26,6 +26,9 @@ pub trait WindowExtOpenHarmony {
   fn content_rect(&self) -> Rect;
 
   fn config(&self) -> Configuration;
+
+  /// Returns the OS-level window ID, used to distinguish main (0) vs sub-windows.
+  fn window_id(&self) -> Option<i64>;
 }
 
 impl WindowExtOpenHarmony for Window {
@@ -36,12 +39,29 @@ impl WindowExtOpenHarmony for Window {
   fn config(&self) -> Configuration {
     self.window.config()
   }
+
+  fn window_id(&self) -> Option<i64> {
+    self.window.window_id()
+  }
 }
 
 /// Additional methods on [`WindowAttributes`] that are specific to OpenHarmony.
 pub trait WindowAttributesExtOpenHarmony {}
 
 impl WindowAttributesExtOpenHarmony for WindowAttributes {}
+
+/// Additional methods on [`WindowBuilder`] that are specific to OpenHarmony.
+pub trait WindowBuilderExtOpenHarmony {
+  /// Sets the window label, used to distinguish main vs sub-windows.
+  fn with_label(self, label: &str) -> Self;
+}
+
+impl WindowBuilderExtOpenHarmony for WindowBuilder {
+  fn with_label(mut self, label: &str) -> Self {
+    self.platform_specific.label = Some(label.to_string());
+    self
+  }
+}
 
 pub trait EventLoopBuilderExtOpenHarmony {
   /// Associates the [`OpenHarmonyApp`] that was passed to `openharmony-ability::ability` with the event loop
