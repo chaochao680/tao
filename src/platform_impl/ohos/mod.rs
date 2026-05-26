@@ -544,9 +544,23 @@ impl DeviceId {
   }
 }
 
+/// OHOS window kind: determines whether this window reuses the existing
+/// UIAbility container (UIAbility) or creates a new OS-level floating window (Float).
+///
+/// Default is UIAbility. Only one UIAbility window can exist (singleton enforced).
+/// Use Float for sub-windows — requires explicit `.ohos_window_kind(Float)` on the builder.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OHOSWindowKind {
+  UIAbility,
+  Float,
+}
+
+static UIABILITY_CREATED: AtomicBool = AtomicBool::new(false);
+
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct PlatformSpecificWindowBuilderAttributes {
     pub label: Option<String>,
+    pub window_kind: Option<OHOSWindowKind>,
 }
 
 pub(crate) struct Window {
@@ -568,25 +582,34 @@ impl Window {
     window_attrs: window::WindowAttributes,
     pl_attrs: PlatformSpecificWindowBuilderAttributes,
   ) -> Result<Self, error::OsError> {
-    // 主窗口的 label 固定为 "main"。
-    // 如果是主窗口，不创建新的 OS 窗口，而是复用已有的主窗口容器 (DefaultXComponent)。
-    // 此时 window_id 为 None，wry 会走 Path 1 (WebViewBuilder)。
-    let is_main_window = pl_attrs.label.as_deref() == Some("main");
-    log::info!("Window:new label: {:?}, title: {:?}", pl_attrs.label, window_attrs.title);
+    let is_main_window = match pl_attrs.window_kind {
+      Some(OHOSWindowKind::UIAbility) => true,
+      Some(OHOSWindowKind::Float) => false,
+      None => !UIABILITY_CREATED.load(Ordering::SeqCst),
+    };
+
+    if is_main_window {
+      if UIABILITY_CREATED.swap(true, Ordering::SeqCst) {
+        log::error!("UIAbility window already exists — only one is allowed");
+        return Err(os_error!(OsError));
+      }
+    }
 
     let window_type = if is_main_window {
-      // 主窗口不需要 window_type
+      // UIAbility window does not need a window_type
       0
     } else {
-      // 子窗口使用 Float 类型
+      // Float sub-window uses TypeFloat
       OHOSWindowType::TypeFloat as i32
     };
 
     let window_id = if is_main_window {
+      // UIAbility window: reuse the existing main window container (DefaultXComponent).
+      // window_id = 0, wry takes Path 1 (WebViewBuilder).
       Some(0)
     } else {
-      // 子窗口需要调用 create_os_window 创建新的 OS 级窗口。
-      // 此时 window_id 为 Some(id)，wry 会走 Path 2 (load_url)。
+      // Float window: create a new OS-level floating window via create_os_window.
+      // window_id > 0, wry takes Path 2 (load_url).
       let label = pl_attrs.label.clone().unwrap_or_else(|| window_attrs.title.clone());
       create_os_window(label, window_type).ok()
     };
