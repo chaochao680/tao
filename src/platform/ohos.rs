@@ -52,8 +52,19 @@ impl WindowAttributesExtOpenHarmony for WindowAttributes {}
 
 /// Additional methods on [`WindowBuilder`] that are specific to OpenHarmony.
 pub trait WindowBuilderExtOpenHarmony {
-  /// Sets the window label, used to distinguish main vs sub-windows.
+  /// Sets the window label, used as the OS-level window name for sub-windows.
   fn with_label(self, label: &str) -> Self;
+
+  /// Sets the OHOS window kind.
+  ///
+  /// - `UIAbility`: Main window that reuses the existing UIAbility container. Only one can exist (singleton).
+  /// - `Float`: Sub-window that creates a new OS-level floating window (TYPE_FLOAT).
+  ///
+  /// Default is `Float` when not specified. Use `UIAbility` for the main window.
+  fn with_window_kind(self, kind: OHOSWindowKind) -> Self;
+
+  /// Returns the current OHOS window kind, if set.
+  fn ohos_window_kind(&self) -> Option<OHOSWindowKind>;
 }
 
 impl WindowBuilderExtOpenHarmony for WindowBuilder {
@@ -61,7 +72,18 @@ impl WindowBuilderExtOpenHarmony for WindowBuilder {
     self.platform_specific.label = Some(label.to_string());
     self
   }
+
+  fn with_window_kind(mut self, kind: OHOSWindowKind) -> Self {
+    self.platform_specific.window_kind = Some(kind);
+    self
+  }
+
+  fn ohos_window_kind(&self) -> Option<OHOSWindowKind> {
+    self.platform_specific.window_kind
+  }
 }
+
+pub use crate::platform_impl::OHOSWindowKind;
 
 pub trait EventLoopBuilderExtOpenHarmony {
   /// Associates the [`OpenHarmonyApp`] that was passed to `openharmony-ability::ability` with the event loop
