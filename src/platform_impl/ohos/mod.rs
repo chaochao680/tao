@@ -2,7 +2,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 use std::hash::Hash;
 use std::marker::PhantomData;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::mpsc;
 use std::ptr::NonNull;
 use std::ffi::c_void;
@@ -512,6 +512,21 @@ impl<T: 'static> EventLoopWindowTarget<T> {
     debug!("`EventLoopWindowTarget::cursor_position` is ignored on OpenHarmony");
     Ok((0, 0).into())
   }
+
+  pub fn set_theme(&self, theme: Option<Theme>) {
+    use openharmony_ability::ColorMode;
+    let color_mode = match theme {
+      Some(Theme::Dark) => ColorMode::Dark,
+      Some(Theme::Light) | None => ColorMode::Light,
+    };
+    let color_mode = match theme {
+      Some(_) => color_mode,
+      None => ColorMode::NoSet,
+    };
+    if let Err(e) = self.app.set_color_mode(color_mode) {
+      log::warn!("EventLoopWindowTarget::set_theme: failed to call setColorMode: {:?}", e);
+    }
+  }
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -566,6 +581,8 @@ pub struct PlatformSpecificWindowBuilderAttributes {
 pub(crate) struct Window {
   app: OpenHarmonyApp,
   window_id: Option<i64>,
+  /// 0 = Light, 1 = Dark
+  theme: AtomicU8,
 }
 
 enum OHOSWindowType {
@@ -617,6 +634,7 @@ impl Window {
     Ok(Self {
       app: el.app.clone(),
       window_id,
+      theme: AtomicU8::new(0),
     })
   }
 
@@ -827,7 +845,32 @@ pub fn inner_position(&self) -> Result<PhysicalPosition<i32>, error::NotSupporte
   pub fn set_background_color(&self, _color: Option<crate::window::RGBA>) {}
 
   pub fn theme(&self) -> Theme {
-    Theme::Light
+    match self.theme.load(Ordering::Relaxed) {
+      1 => Theme::Dark,
+      _ => Theme::Light,
+    }
+  }
+
+  pub fn set_theme(&self, theme: Option<Theme>) {
+    use openharmony_ability::ColorMode;
+    let color_mode = match theme {
+      Some(Theme::Dark) => ColorMode::Dark,
+      Some(Theme::Light) | None => ColorMode::Light,
+    };
+    // Store the resolved theme; None → Light (default)
+    let stored = theme.unwrap_or(Theme::Light);
+    self.theme.store(match stored {
+      Theme::Dark => 1,
+      Theme::Light => 0,
+    }, Ordering::Relaxed);
+    // If theme is None, follow system → NoSet
+    let color_mode = match theme {
+      Some(_) => color_mode,
+      None => ColorMode::NoSet,
+    };
+    if let Err(e) = self.app.set_color_mode(color_mode) {
+      log::warn!("set_theme: failed to call setColorMode: {:?}", e);
+    }
   }
 
   pub fn title(&self) -> String {
