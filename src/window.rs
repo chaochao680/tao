@@ -1200,17 +1200,14 @@ impl Window {
   /// - **iOS / Android:** Unsupported.
   #[inline]
   pub fn set_theme(&self, #[allow(unused)] theme: Option<Theme>) {
-    #[cfg(all(
-      any(
-        windows,
-        target_os = "linux",
-        target_os = "dragonfly",
-        target_os = "freebsd",
-        target_os = "netbsd",
-        target_os = "openbsd",
-        target_os = "macos",
-      ),
-      not(target_env = "ohos")
+    #[cfg(any(
+      windows,
+      target_os = "linux",
+      target_os = "dragonfly",
+      target_os = "freebsd",
+      target_os = "netbsd",
+      target_os = "openbsd",
+      target_os = "macos",
     ))]
     self.window.set_theme(theme)
   }
