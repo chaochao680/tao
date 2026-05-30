@@ -401,15 +401,28 @@ impl<T: 'static> EventLoop<T> {
               event: event::WindowEvent::CloseRequested,
             };
             h(e);
+            // 补发 Destroyed 事件，让 tauri-runtime-wry 可以清理窗口并触发
+            let destroyed = event::Event::WindowEvent {
+              window_id: window::WindowId(WindowId),
+              event: event::WindowEvent::Destroyed,
+            };
+            h(destroyed);
           }
         }
         MainEvent::Destroy => {
-          // XXX: maybe exit mainloop to drop things before being
-          // killed by the OS?
-          warn!("TODO: forward onDestroy notification to application");
+          if let Some(ref mut h) = *self.event_loop.borrow_mut() {
+            h(event::Event::LoopDestroyed);
+          }
         }
         MainEvent::Input(input_event) => {
           self.handle_input_event(&input_event);
+        }
+        MainEvent::NewWant { uri } => {
+          if let Some(url) = url::Url::parse(&uri).ok() {
+            if let Some(ref mut h) = *self.event_loop.borrow_mut() {
+              h(event::Event::Opened { urls: vec![url] });
+            }
+          }
         }
         MainEvent::UserEvent { .. } => {
           if let Some(ref mut h) = *self.event_loop.borrow_mut() {
