@@ -675,13 +675,23 @@ impl Window {
       create_os_window(params).ok()
     };
 
-    Ok(Self {
+    let win = Self {
       app: el.app.clone(),
       window_id,
       theme: AtomicU8::new(0),
       decorations: AtomicBool::new(window_attrs.decorations),
       transparent: window_attrs.transparent,
-    })
+    };
+
+    // Apply decorations immediately for the main window at creation time.
+    // Without this, the main window retains its default OS decorations even if
+    // the builder specified .decorations(false), because Window::set_decorations()
+    // is only called later (if at all) by the user.
+    if is_main_window && !window_attrs.decorations {
+      let _ = set_window_decorations(0, false);
+    }
+
+    Ok(win)
   }
 
   pub fn request_redraw(&self) {}
@@ -894,9 +904,13 @@ pub fn inner_position(&self) -> Result<PhysicalPosition<i32>, error::NotSupporte
   }
 
   pub fn set_background_color(&self, color: Option<crate::window::RGBA>) {
-    // When transparent=true, force transparent (consistent with creation-time priority).
-    // set_background_color is effectively a no-op for transparent windows.
-    let color_u32 = rgba_to_ohos_color(self.transparent, color).unwrap_or(0xFFFFFFFF);
+    // Respect transparent flag: silently ignore background_color when transparent=true,
+    // consistent with creation-time behavior and P3 spec.
+    if self.transparent {
+      log::debug!("[tao-ohos] set_background_color ignored: window is transparent");
+      return;
+    }
+    let color_u32 = rgba_to_ohos_color(false, color).unwrap_or(0xFFFFFFFF);
     if let Some(window_id) = self.window_id {
       let _ = set_window_background_color(window_id, color_u32);
     }
