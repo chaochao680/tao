@@ -417,11 +417,33 @@ impl<T: 'static> EventLoop<T> {
         MainEvent::Input(input_event) => {
           self.handle_input_event(&input_event);
         }
+        // OHOS: intentionally diverges from Android/iOS — always emit Event::Opened
+        // even when urls is empty.
+        //
+        // On Android/iOS, Event::Opened is a pure "open URL" signal and is skipped
+        // when urls is empty. On OHOS, `onNewWant` serves as the "re-launch" signal
+        // (the OS prevents creating a second instance), so we emit Event::Opened on
+        // every re-launch to allow the single-instance plugin to trigger its callback.
+        // The want.parameters from the global Mutex carries system-injected fields
+        // even when no URI is provided.
+        //
+        // Impact on other consumers:
+        // - deep-link plugin: gated with #[cfg(any(macos, ios))], not affected on OHOS
+        // - other consumers: typically just log the urls, no functional side effects
         MainEvent::NewWant { uri } => {
-          if let Some(url) = url::Url::parse(&uri).ok() {
-            if let Some(ref mut h) = *self.event_loop.borrow_mut() {
-              h(event::Event::Opened { urls: vec![url] });
+          let urls = if uri.is_empty() {
+            vec![]
+          } else {
+            match url::Url::parse(&uri) {
+              Ok(url) => vec![url],
+              Err(e) => {
+                log::error!("failed to parse NewWant URI '{uri}': {e}");
+                vec![]
+              }
             }
+          };
+          if let Some(ref mut h) = *self.event_loop.borrow_mut() {
+            h(event::Event::Opened { urls });
           }
         }
         MainEvent::UserEvent { .. } => {
