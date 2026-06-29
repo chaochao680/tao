@@ -693,8 +693,9 @@ impl<T: 'static> EventLoopWindowTarget<T> {
   }
 
   pub fn cursor_position(&self) -> Result<PhysicalPosition<f64>, error::ExternalError> {
-    debug!("`EventLoopWindowTarget::cursor_position` is ignored on OpenHarmony");
-    Ok((0, 0).into())
+    let x = f64::from_bits(openharmony_ability::CURSOR_POSITION_X.load(Ordering::Relaxed));
+    let y = f64::from_bits(openharmony_ability::CURSOR_POSITION_Y.load(Ordering::Relaxed));
+    Ok(PhysicalPosition::new(x, y))
   }
 
   pub fn set_theme(&self, theme: Option<Theme>) {
@@ -1048,8 +1049,9 @@ pub fn inner_position(&self) -> Result<PhysicalPosition<i32>, error::NotSupporte
   }
 
   pub fn cursor_position(&self) -> Result<PhysicalPosition<f64>, error::ExternalError> {
-    debug!("`Window::cursor_position` is ignored on OpenHarmony");
-    Ok((0, 0).into())
+    let x = f64::from_bits(openharmony_ability::CURSOR_POSITION_X.load(Ordering::Relaxed));
+    let y = f64::from_bits(openharmony_ability::CURSOR_POSITION_Y.load(Ordering::Relaxed));
+    Ok(PhysicalPosition::new(x, y))
   }
 
   pub fn set_ignore_cursor_events(&self, _ignore: bool) -> Result<(), error::ExternalError> {
