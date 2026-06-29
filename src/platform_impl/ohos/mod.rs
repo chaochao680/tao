@@ -9,7 +9,7 @@ use std::ffi::c_void;
 
 use keycodes::{to_location, to_logical};
 use openharmony_ability::xcomponent::{Action, MouseButton as OhosMouseButton, TouchEvent};
-use openharmony_ability::{MouseAction, MouseEventData, AxisEventData};
+use openharmony_ability::{MouseAction, MouseEventData, AxisEventData, InputSourceType};
 use openharmony_ability::window::{create_os_window, WindowCreateParams, set_window_decorations, set_window_background_color};
 
 use openharmony_ability::{
@@ -376,17 +376,53 @@ impl<T: 'static> EventLoop<T> {
   fn handle_axis_event(&self, axis_event: &AxisEventData) {
     let window_id = window::WindowId(WindowId);
     let device_id = event::DeviceId(DeviceId(0));
+    let is_touchpad = axis_event.source_type == InputSourceType::Touchpad;
 
     if let Some(ref mut h) = *self.event_loop.borrow_mut() {
-      h(event::Event::WindowEvent {
-        window_id,
-        event: event::WindowEvent::MouseWheel {
-          device_id,
-          delta: event::MouseScrollDelta::LineDelta(axis_event.delta_x, axis_event.delta_y),
-          phase: event::TouchPhase::Moved,
-          modifiers: ModifiersState::empty(),
-        },
-      });
+      // Emit scroll wheel event.
+      // Use PixelDelta for touchpad (pixel-based), LineDelta for mouse wheel (line-based).
+      if axis_event.delta_x != 0.0 || axis_event.delta_y != 0.0 {
+        let delta = if is_touchpad {
+          event::MouseScrollDelta::PixelDelta(PhysicalPosition {
+            x: axis_event.delta_x as f64,
+            y: axis_event.delta_y as f64,
+          })
+        } else {
+          event::MouseScrollDelta::LineDelta(axis_event.delta_x, axis_event.delta_y)
+        };
+
+        h(event::Event::WindowEvent {
+          window_id,
+          event: event::WindowEvent::MouseWheel {
+            device_id,
+            delta,
+            phase: event::TouchPhase::Moved,
+            modifiers: ModifiersState::empty(),
+          },
+        });
+      }
+
+      // Emit pinch scale as Ctrl+MouseWheel, which WebView interprets as zoom.
+      // pinch_scale: 1.0 = no change, >1.0 = zoom in, <1.0 = zoom out, 0.0 = no pinch.
+      if axis_event.pinch_scale != 0.0 && axis_event.pinch_scale != 1.0 {
+        let zoom_delta = if axis_event.pinch_scale > 1.0 {
+          // Zooming in: positive delta
+          1.0
+        } else {
+          // Zooming out: negative delta
+          -1.0
+        };
+
+        h(event::Event::WindowEvent {
+          window_id,
+          event: event::WindowEvent::MouseWheel {
+            device_id,
+            delta: event::MouseScrollDelta::LineDelta(0.0, zoom_delta),
+            phase: event::TouchPhase::Moved,
+            modifiers: ModifiersState::CONTROL,
+          },
+        });
+      }
     }
   }
 
