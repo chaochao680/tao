@@ -1703,3 +1703,17 @@ pub(crate) fn hit_test(
     _ => None,
   }
 }
+
+/// OS-specific extensions for the [`Window`] on OpenHarmony.
+#[cfg(target_env = "ohos")]
+pub trait WindowExtOhos {
+  /// Returns the OHOS OS-level window ID (0 for main UIAbility window, >0 for Float sub-windows).
+  fn ohos_window_id(&self) -> Option<i64>;
+}
+
+#[cfg(target_env = "ohos")]
+impl WindowExtOhos for Window {
+  fn ohos_window_id(&self) -> Option<i64> {
+    self.window.window_id()
+  }
+}
