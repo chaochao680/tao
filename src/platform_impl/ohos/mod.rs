@@ -8,7 +8,8 @@ use std::ptr::NonNull;
 use std::ffi::c_void;
 
 use keycodes::{to_location, to_logical};
-use openharmony_ability::xcomponent::{Action, TouchEvent};
+use openharmony_ability::xcomponent::{Action, MouseButton as OhosMouseButton, TouchEvent};
+use openharmony_ability::{MouseAction, MouseEventData, AxisEventData, InputSourceType};
 use openharmony_ability::window::{create_os_window, WindowCreateParams, set_window_decorations, set_window_background_color};
 
 use openharmony_ability::{
@@ -20,7 +21,7 @@ use crate::dpi::{PhysicalPosition, PhysicalSize, Position, Size};
 use crate::error::{self};
 use crate::event::{self, ElementState, Force, StartCause};
 use crate::event_loop::{self, ControlFlow};
-use crate::keyboard::{Key, KeyCode, KeyLocation, NativeKeyCode};
+use crate::keyboard::{Key, KeyCode, KeyLocation, ModifiersState, NativeKeyCode};
 use crate::monitor;
 use crate::window::{self, Fullscreen, ResizeDirection, Theme, WindowSizeConstraints};
 
@@ -50,6 +51,21 @@ impl<T> PeekableReceiver<T> {
 
 #[derive(Debug, Clone, Eq, PartialEq, Hash)]
 pub struct KeyEventExtra {}
+
+/// Map an OHOS NDK MouseButton to tao's MouseButton.
+///
+/// Returns `None` for `NoneButton` (no meaningful button to report).
+fn ohos_mouse_button_to_tao(button: OhosMouseButton) -> Option<event::MouseButton> {
+  match button {
+    OhosMouseButton::LeftButton => Some(event::MouseButton::Left),
+    OhosMouseButton::RightButton => Some(event::MouseButton::Right),
+    OhosMouseButton::MiddleButton => Some(event::MouseButton::Middle),
+    OhosMouseButton::BackButton => Some(event::MouseButton::Other(4)),
+    OhosMouseButton::ForwardButton => Some(event::MouseButton::Other(5)),
+    OhosMouseButton::NoneButton => None,
+    _ => None,
+  }
+}
 
 pub struct EventLoop<T: 'static> {
   pub(crate) openharmony_app: OpenHarmonyApp,
@@ -118,9 +134,7 @@ impl<T: 'static> EventLoop<T> {
           TouchEvent::Up => Some(event::TouchPhase::Ended),
           TouchEvent::Move => Some(event::TouchPhase::Moved),
           TouchEvent::Cancel => Some(event::TouchPhase::Cancelled),
-          _ => {
-            None // TODO mouse events
-          }
+          _ => None,
         };
 
         if let Some(phase) = phase {
@@ -149,6 +163,12 @@ impl<T: 'static> EventLoop<T> {
             }
           }
         }
+      }
+      InputEvent::MouseEvent(mouse_event) => {
+        self.handle_mouse_event(mouse_event);
+      }
+      InputEvent::AxisEvent(axis_event) => {
+        self.handle_axis_event(axis_event);
       }
       InputEvent::KeyEvent(key) => {
         match key.code {
@@ -273,6 +293,135 @@ impl<T: 'static> EventLoop<T> {
       },
       _ => {
         warn!("Unknown openharmony_ability input event {event:?}")
+      }
+    }
+  }
+
+  /// Handle mouse events from the OHOS NDK, converting them to tao WindowEvents.
+  fn handle_mouse_event(&self, mouse_event: &MouseEventData) {
+    let window_id = window::WindowId(WindowId);
+    // Use device_id 0 for mouse, consistent across events.
+    let device_id = event::DeviceId(DeviceId(0));
+
+    match mouse_event.action {
+      MouseAction::Move => {
+        let position = PhysicalPosition {
+          x: mouse_event.x as f64,
+          y: mouse_event.y as f64,
+        };
+        if let Some(ref mut h) = *self.event_loop.borrow_mut() {
+          h(event::Event::WindowEvent {
+            window_id,
+            event: event::WindowEvent::CursorMoved {
+              device_id,
+              position,
+              modifiers: ModifiersState::empty(),
+            },
+          });
+        }
+      }
+      MouseAction::Press => {
+        if let Some(button) = ohos_mouse_button_to_tao(mouse_event.button) {
+          if let Some(ref mut h) = *self.event_loop.borrow_mut() {
+            h(event::Event::WindowEvent {
+              window_id,
+              event: event::WindowEvent::MouseInput {
+                device_id,
+                state: ElementState::Pressed,
+                button,
+                modifiers: ModifiersState::empty(),
+              },
+            });
+          }
+        }
+      }
+      MouseAction::Release => {
+        if let Some(button) = ohos_mouse_button_to_tao(mouse_event.button) {
+          if let Some(ref mut h) = *self.event_loop.borrow_mut() {
+            h(event::Event::WindowEvent {
+              window_id,
+              event: event::WindowEvent::MouseInput {
+                device_id,
+                state: ElementState::Released,
+                button,
+                modifiers: ModifiersState::empty(),
+              },
+            });
+          }
+        }
+      }
+      MouseAction::HoverEnter => {
+        if let Some(ref mut h) = *self.event_loop.borrow_mut() {
+          h(event::Event::WindowEvent {
+            window_id,
+            event: event::WindowEvent::CursorEntered { device_id },
+          });
+        }
+      }
+      MouseAction::HoverLeave => {
+        if let Some(ref mut h) = *self.event_loop.borrow_mut() {
+          h(event::Event::WindowEvent {
+            window_id,
+            event: event::WindowEvent::CursorLeft { device_id },
+          });
+        }
+      }
+      MouseAction::None => {
+        // Ignore None events
+      }
+    }
+  }
+
+  /// Handle axis (scroll wheel) events from the OHOS ArkUI runtime.
+  fn handle_axis_event(&self, axis_event: &AxisEventData) {
+    let window_id = window::WindowId(WindowId);
+    let device_id = event::DeviceId(DeviceId(0));
+    let is_touchpad = axis_event.source_type == InputSourceType::Touchpad;
+
+    if let Some(ref mut h) = *self.event_loop.borrow_mut() {
+      // Emit scroll wheel event.
+      // Use PixelDelta for touchpad (pixel-based), LineDelta for mouse wheel (line-based).
+      if axis_event.delta_x != 0.0 || axis_event.delta_y != 0.0 {
+        let delta = if is_touchpad {
+          event::MouseScrollDelta::PixelDelta(PhysicalPosition {
+            x: axis_event.delta_x as f64,
+            y: axis_event.delta_y as f64,
+          })
+        } else {
+          event::MouseScrollDelta::LineDelta(axis_event.delta_x, axis_event.delta_y)
+        };
+
+        h(event::Event::WindowEvent {
+          window_id,
+          event: event::WindowEvent::MouseWheel {
+            device_id,
+            delta,
+            phase: event::TouchPhase::Moved,
+            modifiers: ModifiersState::empty(),
+          },
+        });
+      }
+
+      // Emit pinch scale as Ctrl+MouseWheel, which WebView interprets as zoom.
+      // pinch_scale: 1.0 = no change, >1.0 = zoom in, <1.0 = zoom out, 0.0 = no pinch.
+      if axis_event.pinch_scale != 0.0 && axis_event.pinch_scale != 1.0 {
+        let zoom_delta = if axis_event.pinch_scale > 1.0 {
+          // Zooming in: positive delta
+          1.0
+        } else {
+          // Zooming out: negative delta
+          -1.0
+        };
+
+        h(event::Event::WindowEvent {
+          window_id,
+          event: event::WindowEvent::MouseWheel {
+            device_id,
+            delta: event::MouseScrollDelta::LineDelta(0.0, zoom_delta),
+            phase: event::TouchPhase::Moved,
+            modifiers: ModifiersState::CONTROL,
+          },
+        });
       }
     }
   }
@@ -544,8 +693,9 @@ impl<T: 'static> EventLoopWindowTarget<T> {
   }
 
   pub fn cursor_position(&self) -> Result<PhysicalPosition<f64>, error::ExternalError> {
-    debug!("`EventLoopWindowTarget::cursor_position` is ignored on OpenHarmony");
-    Ok((0, 0).into())
+    let x = f64::from_bits(openharmony_ability::CURSOR_POSITION_X.load(Ordering::Relaxed));
+    let y = f64::from_bits(openharmony_ability::CURSOR_POSITION_Y.load(Ordering::Relaxed));
+    Ok(PhysicalPosition::new(x, y))
   }
 
   pub fn set_theme(&self, theme: Option<Theme>) {
@@ -899,8 +1049,9 @@ pub fn inner_position(&self) -> Result<PhysicalPosition<i32>, error::NotSupporte
   }
 
   pub fn cursor_position(&self) -> Result<PhysicalPosition<f64>, error::ExternalError> {
-    debug!("`Window::cursor_position` is ignored on OpenHarmony");
-    Ok((0, 0).into())
+    let x = f64::from_bits(openharmony_ability::CURSOR_POSITION_X.load(Ordering::Relaxed));
+    let y = f64::from_bits(openharmony_ability::CURSOR_POSITION_Y.load(Ordering::Relaxed));
+    Ok(PhysicalPosition::new(x, y))
   }
 
   pub fn set_ignore_cursor_events(&self, _ignore: bool) -> Result<(), error::ExternalError> {
