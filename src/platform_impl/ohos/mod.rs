@@ -1,16 +1,19 @@
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
+use std::ffi::c_void;
 use std::hash::Hash;
 use std::marker::PhantomData;
+use std::ptr::NonNull;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::mpsc;
-use std::ptr::NonNull;
-use std::ffi::c_void;
 
 use keycodes::{to_location, to_logical};
+use openharmony_ability::window::{
+  create_os_window, focus_window, set_window_background_color, set_window_decorations,
+  set_window_focusable, WindowCreateParams,
+};
 use openharmony_ability::xcomponent::{Action, MouseButton as OhosMouseButton, TouchEvent};
-use openharmony_ability::{MouseAction, MouseEventData, AxisEventData, InputSourceType};
-use openharmony_ability::window::{create_os_window, WindowCreateParams, set_window_decorations, set_window_background_color};
+use openharmony_ability::{AxisEventData, InputSourceType, MouseAction, MouseEventData};
 
 use openharmony_ability::{
   ime::KeyboardStatus, Configuration, Event as MainEvent, ImeEvent, InputEvent, OpenHarmonyApp,
@@ -485,8 +488,18 @@ impl<T: 'static> EventLoop<T> {
             h(event);
           }
         }
-        MainEvent::ContentRectChange { .. } => {
-          warn!("TODO: find a way to notify application of content rect change");
+        MainEvent::ContentRectChange(content_rect) => {
+          // Propagate as Resized so tauri's resize handler fires and calls
+          // webview.set_bounds() with the new window dimensions.
+          let size = PhysicalSize::new(content_rect.rect.width as _, content_rect.rect.height as _);
+          let event = event::Event::WindowEvent {
+            window_id: window::WindowId(WindowId),
+            event: event::WindowEvent::Resized(size),
+          };
+
+          if let Some(ref mut h) = *self.event_loop.borrow_mut() {
+            h(event);
+          }
         }
         MainEvent::GainedFocus => {
           HAS_FOCUS.store(true, Ordering::Relaxed);
@@ -709,7 +722,10 @@ impl<T: 'static> EventLoopWindowTarget<T> {
       None => ColorMode::NoSet,
     };
     if let Err(e) = self.app.set_color_mode(color_mode) {
-      log::warn!("EventLoopWindowTarget::set_theme: failed to call setColorMode: {:?}", e);
+      log::warn!(
+        "EventLoopWindowTarget::set_theme: failed to call setColorMode: {:?}",
+        e
+      );
     }
   }
 }
@@ -759,8 +775,8 @@ static UIABILITY_CREATED: AtomicBool = AtomicBool::new(false);
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct PlatformSpecificWindowBuilderAttributes {
-    pub label: Option<String>,
-    pub window_kind: Option<OHOSWindowKind>,
+  pub label: Option<String>,
+  pub window_kind: Option<OHOSWindowKind>,
 }
 
 pub(crate) struct Window {
@@ -781,7 +797,7 @@ enum OHOSWindowType {
   TypeSystemAlert = 1,
   TypeFloat = 8,
   TypeDialog = 16,
-  TypeMain = 32
+  TypeMain = 32,
 }
 
 /// Converts tao's RGBA tuple to OHOS `0xAARRGGBB` u32 format.
@@ -796,8 +812,7 @@ fn rgba_to_ohos_color(transparent: bool, bg: Option<window::RGBA>) -> Option<u32
   if transparent {
     Some(0x00000000)
   } else {
-    bg.map(|(r, g, b, a)|
-      ((a as u32) << 24) | ((r as u32) << 16) | ((g as u32) << 8) | (b as u32))
+    bg.map(|(r, g, b, a)| ((a as u32) << 24) | ((r as u32) << 16) | ((g as u32) << 8) | (b as u32))
   }
 }
 
@@ -835,13 +850,19 @@ impl Window {
     } else {
       // Float window: create a new OS-level floating window via create_os_window.
       // window_id > 0, wry takes Path 2 (load_url).
-      let label = pl_attrs.label.clone().unwrap_or_else(|| window_attrs.title.clone());
+      let label = pl_attrs
+        .label
+        .clone()
+        .unwrap_or_else(|| window_attrs.title.clone());
       let params = WindowCreateParams {
         name: label,
         window_type: window_type as i32,
         decorations: window_attrs.decorations,
         transparent: window_attrs.transparent,
-        background_color: rgba_to_ohos_color(window_attrs.transparent, window_attrs.background_color),
+        background_color: rgba_to_ohos_color(
+          window_attrs.transparent,
+          window_attrs.background_color,
+        ),
         ..WindowCreateParams::default()
       };
       create_os_window(params).ok()
@@ -888,14 +909,17 @@ impl Window {
     v
   }
 
-pub fn inner_position(&self) -> Result<PhysicalPosition<i32>, error::NotSupportedError> {
+  pub fn inner_position(&self) -> Result<PhysicalPosition<i32>, error::NotSupportedError> {
     let content = self.app.content_rect();
     let window = self.app.window_rect();
     // inner_position = content area position on screen
     // = window position + content offset relative to window
     // content_rect.left/top is XComponent offset relative to its parent container
     // In OHOS: Screen -> Window -> Container -> XComponent
-    Ok(PhysicalPosition::new(window.left + content.left, window.top + content.top))
+    Ok(PhysicalPosition::new(
+      window.left + content.left,
+      window.top + content.top,
+    ))
   }
 
   pub fn inner_size(&self) -> PhysicalSize<u32> {
@@ -938,12 +962,31 @@ pub fn inner_position(&self) -> Result<PhysicalPosition<i32>, error::NotSupporte
   pub fn set_visible(&self, _visibility: bool) {}
 
   pub fn set_focus(&self) {
-    //FIXME: implementation goes here
-    warn!("set_focus not yet implemented on OpenHarmony");
+    if let Some(window_id) = self.window_id {
+      if window_id > 0 {
+        if let Err(e) = focus_window(window_id) {
+          warn!(
+            "set_focus: focus_window failed for window {}: {:?}",
+            window_id, e
+          );
+        }
+      }
+      // Main window (window_id = 0): focus is OS-managed, no-op
+    }
   }
 
-  pub fn set_focusable(&self, _focusable: bool) {
-    warn!("set_focusable not yet implemented on OpenHarmony");
+  pub fn set_focusable(&self, focusable: bool) {
+    if let Some(window_id) = self.window_id {
+      if window_id > 0 {
+        if let Err(e) = set_window_focusable(window_id, focusable) {
+          warn!(
+            "set_focusable: set_window_focusable failed for window {}: {:?}",
+            window_id, e
+          );
+        }
+      }
+      // Main window (window_id = 0): focusable is OS-managed, no-op
+    }
   }
 
   pub fn is_focused(&self) -> bool {
@@ -1104,10 +1147,13 @@ pub fn inner_position(&self) -> Result<PhysicalPosition<i32>, error::NotSupporte
     };
     // Store the resolved theme; None → Light (default)
     let stored = theme.unwrap_or(Theme::Light);
-    self.theme.store(match stored {
-      Theme::Dark => 1,
-      Theme::Light => 0,
-    }, Ordering::Relaxed);
+    self.theme.store(
+      match stored {
+        Theme::Dark => 1,
+        Theme::Light => 0,
+      },
+      Ordering::Relaxed,
+    );
     // If theme is None, follow system → NoSet
     let color_mode = match theme {
       Some(_) => color_mode,
