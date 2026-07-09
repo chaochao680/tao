@@ -1,5 +1,5 @@
 use std::cell::{Cell, RefCell};
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::ffi::c_void;
 use std::hash::Hash;
 use std::marker::PhantomData;
@@ -33,6 +33,12 @@ mod keycodes;
 pub(crate) use crate::icon::NoIcon as PlatformIcon;
 
 static HAS_FOCUS: AtomicBool = AtomicBool::new(true);
+
+/// Tracks currently pressed keys for repeat detection.
+/// When a Down event arrives for a key already in this set, it's a repeat.
+thread_local! {
+    static PRESSED_KEYS: RefCell<HashSet<i32>> = RefCell::new(HashSet::new());
+}
 
 struct PeekableReceiver<T> {
   recv: mpsc::Receiver<T>,
@@ -182,6 +188,18 @@ impl<T: 'static> EventLoop<T> {
               _ => event::ElementState::Released,
             };
 
+            // Detect key repeat: if a Down event arrives for a key already
+            // in the pressed set, it's an auto-repeat from holding the key.
+            let key_raw = keycode as i32;
+            let repeat = PRESSED_KEYS.with(|keys| {
+              let mut keys = keys.borrow_mut();
+              match key.action {
+                Action::Down => !keys.insert(key_raw), // false if already present → repeat
+                Action::Up => { keys.remove(&key_raw); false }
+                _ => false,
+              }
+            });
+
             let native = NativeKeyCode::Ohos(keycode.into());
             let physical_key = KeyCode::Unidentified(native);
             let logical_key = to_logical(keycode);
@@ -195,8 +213,7 @@ impl<T: 'static> EventLoop<T> {
                   physical_key,
                   logical_key,
                   location: to_location(keycode),
-                  // TODO
-                  repeat: false,
+                  repeat,
                   text: None,
                   platform_specific: KeyEventExtra {},
                 },
