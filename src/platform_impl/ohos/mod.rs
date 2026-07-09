@@ -1,15 +1,19 @@
 use std::cell::{Cell, RefCell};
 use std::collections::{HashSet, VecDeque};
+use std::ffi::c_void;
 use std::hash::Hash;
 use std::marker::PhantomData;
+use std::ptr::NonNull;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::mpsc;
-use std::ptr::NonNull;
-use std::ffi::c_void;
 
 use keycodes::{to_location, to_logical};
-use openharmony_ability::xcomponent::{Action, TouchEvent};
-use openharmony_ability::window::{create_os_window, WindowCreateParams, set_window_decorations, set_window_background_color};
+use openharmony_ability::window::{
+  create_os_window, focus_window, set_window_background_color, set_window_decorations,
+  set_window_focusable, WindowCreateParams,
+};
+use openharmony_ability::xcomponent::{Action, MouseButton as OhosMouseButton, TouchEvent};
+use openharmony_ability::{AxisEventData, InputSourceType, MouseAction, MouseEventData};
 
 use openharmony_ability::{
   ime::KeyboardStatus, Configuration, Event as MainEvent, ImeEvent, InputEvent, OpenHarmonyApp,
@@ -20,7 +24,7 @@ use crate::dpi::{PhysicalPosition, PhysicalSize, Position, Size};
 use crate::error::{self};
 use crate::event::{self, ElementState, Force, StartCause};
 use crate::event_loop::{self, ControlFlow};
-use crate::keyboard::{Key, KeyCode, KeyLocation, NativeKeyCode};
+use crate::keyboard::{Key, KeyCode, KeyLocation, ModifiersState, NativeKeyCode};
 use crate::monitor;
 use crate::window::{self, Fullscreen, ResizeDirection, Theme, WindowSizeConstraints};
 
@@ -56,6 +60,21 @@ impl<T> PeekableReceiver<T> {
 
 #[derive(Debug, Clone, Eq, PartialEq, Hash)]
 pub struct KeyEventExtra {}
+
+/// Map an OHOS NDK MouseButton to tao's MouseButton.
+///
+/// Returns `None` for `NoneButton` (no meaningful button to report).
+fn ohos_mouse_button_to_tao(button: OhosMouseButton) -> Option<event::MouseButton> {
+  match button {
+    OhosMouseButton::LeftButton => Some(event::MouseButton::Left),
+    OhosMouseButton::RightButton => Some(event::MouseButton::Right),
+    OhosMouseButton::MiddleButton => Some(event::MouseButton::Middle),
+    OhosMouseButton::BackButton => Some(event::MouseButton::Other(4)),
+    OhosMouseButton::ForwardButton => Some(event::MouseButton::Other(5)),
+    OhosMouseButton::NoneButton => None,
+    _ => None,
+  }
+}
 
 pub struct EventLoop<T: 'static> {
   pub(crate) openharmony_app: OpenHarmonyApp,
@@ -124,9 +143,7 @@ impl<T: 'static> EventLoop<T> {
           TouchEvent::Up => Some(event::TouchPhase::Ended),
           TouchEvent::Move => Some(event::TouchPhase::Moved),
           TouchEvent::Cancel => Some(event::TouchPhase::Cancelled),
-          _ => {
-            None // TODO mouse events
-          }
+          _ => None,
         };
 
         if let Some(phase) = phase {
@@ -155,6 +172,12 @@ impl<T: 'static> EventLoop<T> {
             }
           }
         }
+      }
+      InputEvent::MouseEvent(mouse_event) => {
+        self.handle_mouse_event(mouse_event);
+      }
+      InputEvent::AxisEvent(axis_event) => {
+        self.handle_axis_event(axis_event);
       }
       InputEvent::KeyEvent(key) => {
         match key.code {
@@ -294,6 +317,135 @@ impl<T: 'static> EventLoop<T> {
     }
   }
 
+  /// Handle mouse events from the OHOS NDK, converting them to tao WindowEvents.
+  fn handle_mouse_event(&self, mouse_event: &MouseEventData) {
+    let window_id = window::WindowId(WindowId);
+    // Use device_id 0 for mouse, consistent across events.
+    let device_id = event::DeviceId(DeviceId(0));
+
+    match mouse_event.action {
+      MouseAction::Move => {
+        let position = PhysicalPosition {
+          x: mouse_event.x as f64,
+          y: mouse_event.y as f64,
+        };
+        if let Some(ref mut h) = *self.event_loop.borrow_mut() {
+          h(event::Event::WindowEvent {
+            window_id,
+            event: event::WindowEvent::CursorMoved {
+              device_id,
+              position,
+              modifiers: ModifiersState::empty(),
+            },
+          });
+        }
+      }
+      MouseAction::Press => {
+        if let Some(button) = ohos_mouse_button_to_tao(mouse_event.button) {
+          if let Some(ref mut h) = *self.event_loop.borrow_mut() {
+            h(event::Event::WindowEvent {
+              window_id,
+              event: event::WindowEvent::MouseInput {
+                device_id,
+                state: ElementState::Pressed,
+                button,
+                modifiers: ModifiersState::empty(),
+              },
+            });
+          }
+        }
+      }
+      MouseAction::Release => {
+        if let Some(button) = ohos_mouse_button_to_tao(mouse_event.button) {
+          if let Some(ref mut h) = *self.event_loop.borrow_mut() {
+            h(event::Event::WindowEvent {
+              window_id,
+              event: event::WindowEvent::MouseInput {
+                device_id,
+                state: ElementState::Released,
+                button,
+                modifiers: ModifiersState::empty(),
+              },
+            });
+          }
+        }
+      }
+      MouseAction::HoverEnter => {
+        if let Some(ref mut h) = *self.event_loop.borrow_mut() {
+          h(event::Event::WindowEvent {
+            window_id,
+            event: event::WindowEvent::CursorEntered { device_id },
+          });
+        }
+      }
+      MouseAction::HoverLeave => {
+        if let Some(ref mut h) = *self.event_loop.borrow_mut() {
+          h(event::Event::WindowEvent {
+            window_id,
+            event: event::WindowEvent::CursorLeft { device_id },
+          });
+        }
+      }
+      MouseAction::None => {
+        // Ignore None events
+      }
+    }
+  }
+
+  /// Handle axis (scroll wheel) events from the OHOS ArkUI runtime.
+  fn handle_axis_event(&self, axis_event: &AxisEventData) {
+    let window_id = window::WindowId(WindowId);
+    let device_id = event::DeviceId(DeviceId(0));
+    let is_touchpad = axis_event.source_type == InputSourceType::Touchpad;
+
+    if let Some(ref mut h) = *self.event_loop.borrow_mut() {
+      // Emit scroll wheel event.
+      // Use PixelDelta for touchpad (pixel-based), LineDelta for mouse wheel (line-based).
+      if axis_event.delta_x != 0.0 || axis_event.delta_y != 0.0 {
+        let delta = if is_touchpad {
+          event::MouseScrollDelta::PixelDelta(PhysicalPosition {
+            x: axis_event.delta_x as f64,
+            y: axis_event.delta_y as f64,
+          })
+        } else {
+          event::MouseScrollDelta::LineDelta(axis_event.delta_x, axis_event.delta_y)
+        };
+
+        h(event::Event::WindowEvent {
+          window_id,
+          event: event::WindowEvent::MouseWheel {
+            device_id,
+            delta,
+            phase: event::TouchPhase::Moved,
+            modifiers: ModifiersState::empty(),
+          },
+        });
+      }
+
+      // Emit pinch scale as Ctrl+MouseWheel, which WebView interprets as zoom.
+      // pinch_scale: 1.0 = no change, >1.0 = zoom in, <1.0 = zoom out, 0.0 = no pinch.
+      if axis_event.pinch_scale != 0.0 && axis_event.pinch_scale != 1.0 {
+        let zoom_delta = if axis_event.pinch_scale > 1.0 {
+          // Zooming in: positive delta
+          1.0
+        } else {
+          // Zooming out: negative delta
+          -1.0
+        };
+
+        h(event::Event::WindowEvent {
+          window_id,
+          event: event::WindowEvent::MouseWheel {
+            device_id,
+            delta: event::MouseScrollDelta::LineDelta(0.0, zoom_delta),
+            phase: event::TouchPhase::Moved,
+            modifiers: ModifiersState::CONTROL,
+          },
+        });
+      }
+    }
+  }
+
   pub fn run<F>(self, event_handler: F) -> ()
   where
     F: FnMut(event::Event<T>, &event_loop::EventLoopWindowTarget<T>, &mut ControlFlow),
@@ -353,8 +505,18 @@ impl<T: 'static> EventLoop<T> {
             h(event);
           }
         }
-        MainEvent::ContentRectChange { .. } => {
-          warn!("TODO: find a way to notify application of content rect change");
+        MainEvent::ContentRectChange(content_rect) => {
+          // Propagate as Resized so tauri's resize handler fires and calls
+          // webview.set_bounds() with the new window dimensions.
+          let size = PhysicalSize::new(content_rect.rect.width as _, content_rect.rect.height as _);
+          let event = event::Event::WindowEvent {
+            window_id: window::WindowId(WindowId),
+            event: event::WindowEvent::Resized(size),
+          };
+
+          if let Some(ref mut h) = *self.event_loop.borrow_mut() {
+            h(event);
+          }
         }
         MainEvent::GainedFocus => {
           HAS_FOCUS.store(true, Ordering::Relaxed);
@@ -561,8 +723,9 @@ impl<T: 'static> EventLoopWindowTarget<T> {
   }
 
   pub fn cursor_position(&self) -> Result<PhysicalPosition<f64>, error::ExternalError> {
-    debug!("`EventLoopWindowTarget::cursor_position` is ignored on OpenHarmony");
-    Ok((0, 0).into())
+    let x = f64::from_bits(openharmony_ability::CURSOR_POSITION_X.load(Ordering::Relaxed));
+    let y = f64::from_bits(openharmony_ability::CURSOR_POSITION_Y.load(Ordering::Relaxed));
+    Ok(PhysicalPosition::new(x, y))
   }
 
   pub fn set_theme(&self, theme: Option<Theme>) {
@@ -576,7 +739,10 @@ impl<T: 'static> EventLoopWindowTarget<T> {
       None => ColorMode::NoSet,
     };
     if let Err(e) = self.app.set_color_mode(color_mode) {
-      log::warn!("EventLoopWindowTarget::set_theme: failed to call setColorMode: {:?}", e);
+      log::warn!(
+        "EventLoopWindowTarget::set_theme: failed to call setColorMode: {:?}",
+        e
+      );
     }
   }
 }
@@ -626,8 +792,8 @@ static UIABILITY_CREATED: AtomicBool = AtomicBool::new(false);
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct PlatformSpecificWindowBuilderAttributes {
-    pub label: Option<String>,
-    pub window_kind: Option<OHOSWindowKind>,
+  pub label: Option<String>,
+  pub window_kind: Option<OHOSWindowKind>,
 }
 
 pub(crate) struct Window {
@@ -648,7 +814,7 @@ enum OHOSWindowType {
   TypeSystemAlert = 1,
   TypeFloat = 8,
   TypeDialog = 16,
-  TypeMain = 32
+  TypeMain = 32,
 }
 
 /// Converts tao's RGBA tuple to OHOS `0xAARRGGBB` u32 format.
@@ -663,8 +829,7 @@ fn rgba_to_ohos_color(transparent: bool, bg: Option<window::RGBA>) -> Option<u32
   if transparent {
     Some(0x00000000)
   } else {
-    bg.map(|(r, g, b, a)|
-      ((a as u32) << 24) | ((r as u32) << 16) | ((g as u32) << 8) | (b as u32))
+    bg.map(|(r, g, b, a)| ((a as u32) << 24) | ((r as u32) << 16) | ((g as u32) << 8) | (b as u32))
   }
 }
 
@@ -702,13 +867,19 @@ impl Window {
     } else {
       // Float window: create a new OS-level floating window via create_os_window.
       // window_id > 0, wry takes Path 2 (load_url).
-      let label = pl_attrs.label.clone().unwrap_or_else(|| window_attrs.title.clone());
+      let label = pl_attrs
+        .label
+        .clone()
+        .unwrap_or_else(|| window_attrs.title.clone());
       let params = WindowCreateParams {
         name: label,
         window_type: window_type as i32,
         decorations: window_attrs.decorations,
         transparent: window_attrs.transparent,
-        background_color: rgba_to_ohos_color(window_attrs.transparent, window_attrs.background_color),
+        background_color: rgba_to_ohos_color(
+          window_attrs.transparent,
+          window_attrs.background_color,
+        ),
         ..WindowCreateParams::default()
       };
       create_os_window(params).ok()
@@ -755,14 +926,17 @@ impl Window {
     v
   }
 
-pub fn inner_position(&self) -> Result<PhysicalPosition<i32>, error::NotSupportedError> {
+  pub fn inner_position(&self) -> Result<PhysicalPosition<i32>, error::NotSupportedError> {
     let content = self.app.content_rect();
     let window = self.app.window_rect();
     // inner_position = content area position on screen
     // = window position + content offset relative to window
     // content_rect.left/top is XComponent offset relative to its parent container
     // In OHOS: Screen -> Window -> Container -> XComponent
-    Ok(PhysicalPosition::new(window.left + content.left, window.top + content.top))
+    Ok(PhysicalPosition::new(
+      window.left + content.left,
+      window.top + content.top,
+    ))
   }
 
   pub fn inner_size(&self) -> PhysicalSize<u32> {
@@ -805,12 +979,31 @@ pub fn inner_position(&self) -> Result<PhysicalPosition<i32>, error::NotSupporte
   pub fn set_visible(&self, _visibility: bool) {}
 
   pub fn set_focus(&self) {
-    //FIXME: implementation goes here
-    warn!("set_focus not yet implemented on OpenHarmony");
+    if let Some(window_id) = self.window_id {
+      if window_id > 0 {
+        if let Err(e) = focus_window(window_id) {
+          warn!(
+            "set_focus: focus_window failed for window {}: {:?}",
+            window_id, e
+          );
+        }
+      }
+      // Main window (window_id = 0): focus is OS-managed, no-op
+    }
   }
 
-  pub fn set_focusable(&self, _focusable: bool) {
-    warn!("set_focusable not yet implemented on OpenHarmony");
+  pub fn set_focusable(&self, focusable: bool) {
+    if let Some(window_id) = self.window_id {
+      if window_id > 0 {
+        if let Err(e) = set_window_focusable(window_id, focusable) {
+          warn!(
+            "set_focusable: set_window_focusable failed for window {}: {:?}",
+            window_id, e
+          );
+        }
+      }
+      // Main window (window_id = 0): focusable is OS-managed, no-op
+    }
   }
 
   pub fn is_focused(&self) -> bool {
@@ -916,8 +1109,9 @@ pub fn inner_position(&self) -> Result<PhysicalPosition<i32>, error::NotSupporte
   }
 
   pub fn cursor_position(&self) -> Result<PhysicalPosition<f64>, error::ExternalError> {
-    debug!("`Window::cursor_position` is ignored on OpenHarmony");
-    Ok((0, 0).into())
+    let x = f64::from_bits(openharmony_ability::CURSOR_POSITION_X.load(Ordering::Relaxed));
+    let y = f64::from_bits(openharmony_ability::CURSOR_POSITION_Y.load(Ordering::Relaxed));
+    Ok(PhysicalPosition::new(x, y))
   }
 
   pub fn set_ignore_cursor_events(&self, _ignore: bool) -> Result<(), error::ExternalError> {
@@ -970,10 +1164,13 @@ pub fn inner_position(&self) -> Result<PhysicalPosition<i32>, error::NotSupporte
     };
     // Store the resolved theme; None → Light (default)
     let stored = theme.unwrap_or(Theme::Light);
-    self.theme.store(match stored {
-      Theme::Dark => 1,
-      Theme::Light => 0,
-    }, Ordering::Relaxed);
+    self.theme.store(
+      match stored {
+        Theme::Dark => 1,
+        Theme::Light => 0,
+      },
+      Ordering::Relaxed,
+    );
     // If theme is None, follow system → NoSet
     let color_mode = match theme {
       Some(_) => color_mode,
