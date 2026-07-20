@@ -10,7 +10,8 @@ use std::sync::mpsc;
 use keycodes::{to_location, to_logical};
 use openharmony_ability::window::{
   create_os_window, focus_window, set_window_background_color, set_window_decorations,
-  set_window_focusable, WindowCreateParams,
+  set_window_focusable, move_window_to, resize_window, minimize_window, maximize_window,
+  restore_window, recover_window, show_window, is_window_maximized, is_window_minimized, WindowCreateParams,
 };
 use openharmony_ability::xcomponent::{Action, MouseButton as OhosMouseButton, TouchEvent};
 use openharmony_ability::{AxisEventData, InputSourceType, MouseAction, MouseEventData};
@@ -940,12 +941,29 @@ impl Window {
   }
 
   pub fn inner_size(&self) -> PhysicalSize<u32> {
-    let rect = self.app.content_rect();
+    // On OHOS desktop, win.resize(w, h) sets the OUTER size (including title bar).
+    // Return window_rect (outer) so save→resize cycles are idempotent:
+    // save inner_size (=outer) → restore via resize(outer) → outer unchanged.
+    // The Web component uses .width("100%") (natural layout), so it does not
+    // depend on inner_size for sizing — this change only affects window-state
+    // save/restore and bounds rate calculations (unused for sizing with "100%").
+    let rect = self.app.window_rect();
     PhysicalSize::new(rect.width as _, rect.height as _)
   }
 
-  pub fn set_inner_size(&self, _size: Size) {
-    warn!("Cannot set window size on OpenHarmony");
+  pub fn set_inner_size(&self, size: Size) {
+    if let Some(window_id) = self.window_id {
+      // OHOS win.resize(w, h) sets the OUTER size. inner_size() returns window_rect
+      // (outer) so save→resize is idempotent on the PhysicalSize path (to_physical is
+      // identity for PhysicalSize). For LogicalSize, convert via the real scale_factor
+      // (a hardcoded 1.0 would halve the window on DPR≠1 displays). The ArkTS side
+      // (WindowManager.resizeWindow) does NOT compensate — it calls win.resize(w, h)
+      // directly, so the value passed here is the outer size.
+      let physical = size.to_physical::<i32>(self.scale_factor());
+      if let Err(e) = resize_window(window_id, physical.width as i64, physical.height as i64) {
+        log::warn!("[tao-ohos] resize_window failed for window {}: {}", window_id, e);
+      }
+    }
   }
   pub fn set_inner_size_constraints(&self, _: WindowSizeConstraints) {}
 
@@ -954,8 +972,13 @@ impl Window {
     Ok(PhysicalPosition::new(rect.left, rect.top))
   }
 
-  pub fn set_outer_position(&self, _position: Position) {
-    // no effect
+  pub fn set_outer_position(&self, position: Position) {
+    if let Some(window_id) = self.window_id {
+      let physical = position.to_physical::<i32>(self.scale_factor());
+      if let Err(e) = move_window_to(window_id, physical.x as i64, physical.y as i64) {
+        log::warn!("[tao-ohos] move_window_to failed for window {}: {}", window_id, e);
+      }
+    }
   }
 
   pub fn outer_size(&self) -> PhysicalSize<u32> {
@@ -976,7 +999,27 @@ impl Window {
 
   pub fn set_title(&self, _title: &str) {}
 
-  pub fn set_visible(&self, _visibility: bool) {}
+  pub fn set_visible(&self, visibility: bool) {
+    // window_id 0 (main window) is valid for minimize/restore/show/move/resize/maximize
+    // (unlike set_focus/set_focusable, where the main window is OS-managed and guarded
+    // with `window_id > 0`), so no guard here — programmatic minimize on the main window
+    // works (verified on device).
+    //
+    // OHOS has no direct window-hide API, so set_visible(false) uses minimize as a
+    // workaround. Side effect: getWindowStatus() returns MINIMIZE afterwards, so
+    // is_minimized() returns true (unlike Windows/macOS hide, which leaves the
+    // minimized state unchanged). set_visible(true) uses restore (API14) + show_window;
+    // on API12 restore is unavailable → show_window best-effort (may not restore a
+    // minimized main window).
+    if let Some(window_id) = self.window_id {
+      if visibility {
+        if let Err(e) = restore_window(window_id) { log::warn!("[tao-ohos] restore_window failed for window {}: {}", window_id, e); }
+        if let Err(e) = show_window(window_id) { log::warn!("[tao-ohos] show_window failed for window {}: {}", window_id, e); }
+      } else {
+        if let Err(e) = minimize_window(window_id) { log::warn!("[tao-ohos] minimize_window failed for window {}: {}", window_id, e); }
+      }
+    }
+  }
 
   pub fn set_focus(&self) {
     if let Some(window_id) = self.window_id {
@@ -1031,16 +1074,47 @@ impl Window {
     warn!("`Window::set_closable` is ignored on OpenHarmony")
   }
 
-  pub fn set_minimized(&self, _minimized: bool) {}
-
-  pub fn is_minimized(&self) -> bool {
-    false
+  pub fn set_minimized(&self, minimized: bool) {
+    if let Some(window_id) = self.window_id {
+      if minimized {
+        if let Err(e) = minimize_window(window_id) { log::warn!("[tao-ohos] minimize_window failed for window {}: {}", window_id, e); }
+      } else {
+        if let Err(e) = restore_window(window_id) { log::warn!("[tao-ohos] restore_window failed for window {}: {}", window_id, e); }
+      }
+    }
   }
 
-  pub fn set_maximized(&self, _maximized: bool) {}
+  pub fn is_minimized(&self) -> bool {
+    if let Some(window_id) = self.window_id {
+      is_window_minimized(window_id).unwrap_or_else(|e| {
+        log::warn!("[tao-ohos] is_window_minimized failed for window {}: {}", window_id, e);
+        false
+      })
+    } else {
+      false
+    }
+  }
+
+  pub fn set_maximized(&self, maximized: bool) {
+    if let Some(window_id) = self.window_id {
+      if maximized {
+        if let Err(e) = maximize_window(window_id) { log::warn!("[tao-ohos] maximize_window failed for window {}: {}", window_id, e); }
+      } else {
+        // recover() switches MAXIMIZE/FULL_SCREEN → FLOATING (API7+, public)
+        if let Err(e) = recover_window(window_id) { log::warn!("[tao-ohos] recover_window failed for window {}: {}", window_id, e); }
+      }
+    }
+  }
 
   pub fn is_maximized(&self) -> bool {
-    false
+    if let Some(window_id) = self.window_id {
+      is_window_maximized(window_id).unwrap_or_else(|e| {
+        log::warn!("[tao-ohos] is_window_maximized failed for window {}: {}", window_id, e);
+        false
+      })
+    } else {
+      false
+    }
   }
 
   pub fn set_fullscreen(&self, _monitor: Option<Fullscreen>) {
