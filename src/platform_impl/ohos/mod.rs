@@ -1345,8 +1345,13 @@ impl MonitorHandle {
   }
 
   pub fn size(&self) -> PhysicalSize<u32> {
-    let size = self.app.content_rect();
-    PhysicalSize::new(size.width as _, size.height as _)
+    // Real physical display dimensions — NOT the window's content_rect (which is
+    // the window's own content area and is smaller than the screen). Using
+    // content_rect here made positioner `Center` compute to negative coords
+    // (content/2 - outer/2 < 0) which OHOS clamps to (0,0), so windows snapped
+    // to top-left instead of centering.
+    let (width, height) = self.app.display_size();
+    PhysicalSize::new(width, height)
   }
 
   pub fn position(&self) -> PhysicalPosition<i32> {
