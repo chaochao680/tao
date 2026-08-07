@@ -734,6 +734,11 @@ impl Window {
   /// - **iOS:** Can only be called on the main thread. Sets the top left coordinates of the
   ///   window in the screen space coordinate system.
   /// - **Android / Linux(Wayland):** Unsupported.
+  /// - **OpenHarmony:** Only affects Float sub-windows (window_id > 0). The main UIAbility
+  ///   window (window_id = 0) is system-managed — `window.Window.moveWindowTo()` returns
+  ///   error 1300002 ("window state is abnormal"), so the call is a silent no-op for the
+  ///   main window. Create a Float sub-window via `WebviewWindowBuilder` (or
+  ///   `create_os_window`) to set position.
   #[inline]
   pub fn set_outer_position<P: Into<Position>>(&self, position: P) {
     self.window.set_outer_position(position.into())
@@ -762,6 +767,11 @@ impl Window {
   /// ## Platform-specific
   ///
   /// - **iOS / Android:** Unsupported.
+  /// - **OpenHarmony:** Only affects Float sub-windows (window_id > 0). The main UIAbility
+  ///   window (window_id = 0) is system-managed — `window.Window.resize()` returns error
+  ///   1300002 ("window state is abnormal"), so the call is a silent no-op for the main
+  ///   window. Create a Float sub-window via `WebviewWindowBuilder` (or `create_os_window`)
+  ///   to resize.
   #[inline]
   pub fn set_inner_size<S: Into<Size>>(&self, size: S) {
     self.window.set_inner_size(size.into())
