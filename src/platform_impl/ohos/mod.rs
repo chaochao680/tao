@@ -591,6 +591,13 @@ impl<T: 'static> EventLoop<T> {
           // last-inserted window, which may be a different window than the one
           // being closed. This caused the main window's webview to be removed
           // from the manager when a secondary UIAbility window was closed.
+          //
+          // TODO(遗留问题一): 这是 ZST WindowId 模型不匹配的补偿性 no-op。
+          //   根因与根治路径见 doc/OHOS窗口遗留问题.md(问题一)
+          //   - 短期: 给 MainEvent::WindowDestroy 加 i32 载荷(ArkTS 已有 readWindowId)
+          //   - 治本: 让 platform_impl::WindowId 携带真实 OHOS i64,ZST → struct(i64)
+          //   当前边界: 系统返回键/划任务/内存回收杀进程等路径不派发 Destroyed,
+          //   由 LoopDestroyed 兜底发 ExitRequested。详见文档第九节。
         }
         MainEvent::Destroy => {
           if let Some(ref mut h) = *self.event_loop.borrow_mut() {
@@ -812,6 +819,11 @@ pub(crate) struct Window {
   /// creation; runtime set_background_color now also applies color (consistent
   /// with other platforms).
   transparent: bool,
+  // TODO(遗留问题五): 以下 Atomic 镜像位与 ArkTS 真实状态缺乏双向同步:
+  //   - maximized/minimized 是僵尸字段(从不 store/load,is_* 实际查系统)
+  //   - visible/fullscreen/decorations/always_on_top 单向写不回读,系统状态变化不回灌
+  //   - is_visible()/fullscreen() 读本地镜像,不可信
+  //   根因与修复(补系统状态回灌、删僵尸字段)见 doc/OHOS窗口遗留问题.md(问题五)。
   /// 窗口状态镜像。tao 侧维护，OHOS 事件回灌后更新（后续 MainEvent 扩展）。
   /// 默认 maximized/minimized=false，visible=true，fullscreen=false。
   maximized: AtomicBool,
@@ -1024,6 +1036,9 @@ impl Window {
     PhysicalSize::new(rect.width as _, rect.height as _)
   }
 
+  // TODO(遗留问题二): set_inner_size 走 win.resize 改的是外尺寸(含标题栏),
+  //   与 inner 语义不符,导致 save→restore 不幂等(每次循环缩小一个标题栏高度)。
+  //   根因与修复方向见 doc/OHOS窗口遗留问题.md(问题二)。
   pub fn set_inner_size(&self, size: Size) {
     let s = size.to_physical::<u32>(self.scale_factor());
     let _ = resize_window(self.ohos_win_id(), s.width as i64, s.height as i64);
@@ -1040,6 +1055,8 @@ impl Window {
     let _ = move_window_to(self.ohos_win_id(), p.x as i64, p.y as i64);
   }
 
+  // TODO(遗留问题二): outer_size 读 window_rect 正确,但 set_inner_size 写的是外尺寸,
+  //   inner/outer 语义错位。详见 doc/OHOS窗口遗留问题.md(问题二)。
   pub fn outer_size(&self) -> PhysicalSize<u32> {
     let window = self.app.window_rect();
     // window_rect is set by ArkTS callback, may be (0,0,0,0) initially
@@ -1058,6 +1075,10 @@ impl Window {
 
   pub fn set_title(&self, _title: &str) {}
 
+  // TODO(遗留问题三): hide_window 在 OHOS 上无统一实现 —— UIAbility 主窗口用
+  //   hideAbility(需状态栏前置条件),Float 子窗口用 minimize 冒充(语义不符,
+  //   is_minimized 误报 true);且 show/hide 不对称(主窗口 hide 后 show 无法恢复)。
+  //   详见 doc/OHOS窗口遗留问题.md(问题三)。
   pub fn set_visible(&self, visibility: bool) {
     self.visible.store(visibility, Ordering::Release);
     let id = self.ohos_win_id();
@@ -1080,6 +1101,11 @@ impl Window {
     self.always_on_top.load(Ordering::Acquire)
   }
 
+  // TODO(遗留问题四): set_resizable/set_minimizable/set_maximizable/set_closable
+  //   名义控制"窗口能否 resize/最小化/最大化/关闭",实际 set_decoration_flag 只改
+  //   装饰按钮显隐(FloatPage @LocalStorageProp),不拦截 set_minimized/set_maximized/
+  //   close/set_inner_size 等编程式 API。is_resizable 等也从本地镜像读,返回假承诺。
+  //   主窗口完全 no-op。详见 doc/OHOS窗口遗留问题.md(问题四)。
   pub fn set_resizable(&self, resizable: bool) {
     self.set_decoration_flag(FLAG_RESIZABLE, resizable);
   }
@@ -1163,6 +1189,8 @@ impl Window {
   pub fn set_always_on_bottom(&self, _always_on_bottom: bool) {}
 
   pub fn set_always_on_top(&self, always_on_top: bool) {
+    // TODO(遗留问题六): 本函数为 no-op(无 z-order API),行为未经真机测试。
+    //   验证清单(确认 no-op + warn 行为、Float 看似生效)见 doc/OHOS窗口遗留问题.md(问题六)。
     // OHOS 无跨窗口 z-order 公开 API。Float 子窗口天然浮于主窗口之上；
     // 主 UIAbility 窗口的置顶由系统管理。此处仅记录意图，is_always_on_top 据此返回。
     // 后续若 OHOS 开放 setWindowType/z-level API，在此接入 openharmony-ability 封装。
@@ -1200,6 +1228,8 @@ impl Window {
   pub fn set_window_icon(&self, _window_icon: Option<crate::icon::Icon>) {}
 
   pub fn set_cursor_icon(&self, icon: window::CursorIcon) {
+    // TODO(遗留问题六): 已 dispatch 但未经真机测试 — 需验证 style 映射覆盖、
+    //   触摸态设备行为、Float 子窗口是否生效。见 doc/OHOS窗口遗留问题.md(问题六)。
     // 按 windowId 设置光标样式（pointer.setPointerStyleSync）。
     let style = ohos_pointer_style(icon);
     if let Err(e) = set_pointer_style(self.ohos_win_id(), style) {
@@ -1227,6 +1257,8 @@ impl Window {
   }
 
   pub fn set_ignore_cursor_events(&self, ignore: bool) -> Result<(), error::ExternalError> {
+    // TODO(遗留问题六): 已 dispatch 但未经真机测试 — 需验证穿透模式可见不响应、
+    //   穿透事件落到下层、主窗口/Float 行为一致性。见 doc/OHOS窗口遗留问题.md(问题六)。
     // tao 语义：ignore=true 表示忽略光标事件（点击穿透）。
     // OHOS setWindowTouchable：touchable=true 可触摸，false 穿透。故 touchable = !ignore。
     if let Err(e) = set_window_touchable(self.ohos_win_id(), !ignore) {
@@ -1236,6 +1268,9 @@ impl Window {
   }
 
   pub fn set_cursor_visible(&self, visible: bool) {
+    // TODO(遗留问题六): 已 dispatch 但未经真机测试 — 需验证作用域(全局 vs 窗口级):
+    //   pointer.setPointerVisible 是全局光标显隐,tao 语义是窗口级,多窗口下会连带影响其他窗口。
+    //   见 doc/OHOS窗口遗留问题.md(问题六)。
     // 全局光标显隐（@ohos.multimodalInput.pointer.setPointerVisible）。
     if let Err(e) = set_pointer_visible(visible) {
       log::warn!("set_cursor_visible failed to dispatch: {:?}", e);
