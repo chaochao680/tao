@@ -13,7 +13,9 @@ use openharmony_ability::{MouseAction, MouseEventData, AxisEventData, InputSourc
 use openharmony_ability::window::{
   create_os_window, WindowCreateParams, set_window_decorations, set_window_background_color,
   move_window_to, resize_window,
-  maximize_window, minimize_window, restore_window, show_window, hide_window, focus_window,
+  maximize_window, minimize_window, restore_window, recover_window,
+  show_window, hide_window, focus_window,
+  is_window_maximized, is_window_minimized,
   set_fullscreen as ohos_set_fullscreen, set_window_touchable,
   set_window_decoration_flags, set_window_focusable,
   set_pointer_visible, set_pointer_style,
@@ -510,8 +512,18 @@ impl<T: 'static> EventLoop<T> {
             h(event);
           }
         }
-        MainEvent::ContentRectChange { .. } => {
-          warn!("TODO: find a way to notify application of content rect change");
+        MainEvent::ContentRectChange(content_rect) => {
+          // Propagate as Resized so tauri's resize handler fires and calls
+          // webview.set_bounds() with the new window dimensions.
+          let size = PhysicalSize::new(content_rect.rect.width as _, content_rect.rect.height as _);
+          let event = event::Event::WindowEvent {
+            window_id: window::WindowId(WindowId),
+            event: event::WindowEvent::Resized(size),
+          };
+
+          if let Some(ref mut h) = *self.event_loop.borrow_mut() {
+            h(event);
+          }
         }
         MainEvent::GainedFocus => {
           HAS_FOCUS.store(true, Ordering::Relaxed);
@@ -1093,31 +1105,38 @@ impl Window {
   }
 
   pub fn set_minimized(&self, minimized: bool) {
-    self.minimized.store(minimized, Ordering::Release);
     let id = self.ohos_win_id();
     if minimized {
-      let _ = minimize_window(id);
+      if let Err(e) = minimize_window(id) { log::warn!("[tao-ohos] minimize_window failed for window {}: {}", id, e); }
     } else {
-      let _ = restore_window(id);
+      if let Err(e) = restore_window(id) { log::warn!("[tao-ohos] restore_window failed for window {}: {}", id, e); }
     }
   }
 
   pub fn is_minimized(&self) -> bool {
-    self.minimized.load(Ordering::Acquire)
+    let id = self.ohos_win_id();
+    is_window_minimized(id).unwrap_or_else(|e| {
+      log::warn!("[tao-ohos] is_window_minimized failed for window {}: {}", id, e);
+      false
+    })
   }
 
   pub fn set_maximized(&self, maximized: bool) {
-    self.maximized.store(maximized, Ordering::Release);
     let id = self.ohos_win_id();
     if maximized {
-      let _ = maximize_window(id);
+      if let Err(e) = maximize_window(id) { log::warn!("[tao-ohos] maximize_window failed for window {}: {}", id, e); }
     } else {
-      let _ = restore_window(id);
+      // recover() switches MAXIMIZE/FULL_SCREEN → FLOATING (API7+, public)
+      if let Err(e) = recover_window(id) { log::warn!("[tao-ohos] recover_window failed for window {}: {}", id, e); }
     }
   }
 
   pub fn is_maximized(&self) -> bool {
-    self.maximized.load(Ordering::Acquire)
+    let id = self.ohos_win_id();
+    is_window_maximized(id).unwrap_or_else(|e| {
+      log::warn!("[tao-ohos] is_window_maximized failed for window {}: {}", id, e);
+      false
+    })
   }
 
   pub fn set_fullscreen(&self, monitor: Option<Fullscreen>) {
