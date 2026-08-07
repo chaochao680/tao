@@ -1,20 +1,24 @@
 use std::cell::{Cell, RefCell};
-use std::collections::{HashSet, VecDeque};
-use std::ffi::c_void;
+use std::collections::VecDeque;
 use std::hash::Hash;
 use std::marker::PhantomData;
-use std::ptr::NonNull;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::mpsc;
+use std::ptr::NonNull;
+use std::ffi::c_void;
 
 use keycodes::{to_location, to_logical};
-use openharmony_ability::window::{
-  create_os_window, focus_window, set_window_background_color, set_window_decorations,
-  set_window_focusable, move_window_to, resize_window, minimize_window, maximize_window,
-  restore_window, recover_window, show_window, is_window_maximized, is_window_minimized, WindowCreateParams,
-};
 use openharmony_ability::xcomponent::{Action, MouseButton as OhosMouseButton, TouchEvent};
-use openharmony_ability::{AxisEventData, InputSourceType, MouseAction, MouseEventData};
+use openharmony_ability::{MouseAction, MouseEventData, AxisEventData, InputSourceType};
+use openharmony_ability::window::{
+  create_os_window, WindowCreateParams, set_window_decorations, set_window_background_color,
+  move_window_to, resize_window,
+  maximize_window, minimize_window, restore_window, show_window, hide_window, focus_window,
+  set_fullscreen as ohos_set_fullscreen, set_window_touchable,
+  set_window_decoration_flags, set_window_focusable,
+  set_pointer_visible, set_pointer_style,
+  start_ui_ability, next_window_id,
+};
 
 use openharmony_ability::{
   ime::KeyboardStatus, Configuration, Event as MainEvent, ImeEvent, InputEvent, OpenHarmonyApp,
@@ -34,12 +38,6 @@ mod keycodes;
 pub(crate) use crate::icon::NoIcon as PlatformIcon;
 
 static HAS_FOCUS: AtomicBool = AtomicBool::new(true);
-
-/// Tracks currently pressed keys for repeat detection.
-/// When a Down event arrives for a key already in this set, it's a repeat.
-thread_local! {
-    static PRESSED_KEYS: RefCell<HashSet<i32>> = RefCell::new(HashSet::new());
-}
 
 struct PeekableReceiver<T> {
   recv: mpsc::Receiver<T>,
@@ -189,18 +187,6 @@ impl<T: 'static> EventLoop<T> {
               _ => event::ElementState::Released,
             };
 
-            // Detect key repeat: if a Down event arrives for a key already
-            // in the pressed set, it's an auto-repeat from holding the key.
-            let key_raw = keycode as i32;
-            let repeat = PRESSED_KEYS.with(|keys| {
-              let mut keys = keys.borrow_mut();
-              match key.action {
-                Action::Down => !keys.insert(key_raw), // false if already present → repeat
-                Action::Up => { keys.remove(&key_raw); false }
-                _ => false,
-              }
-            });
-
             let native = NativeKeyCode::Ohos(keycode.into());
             let physical_key = KeyCode::Unidentified(native);
             let logical_key = to_logical(keycode);
@@ -214,7 +200,8 @@ impl<T: 'static> EventLoop<T> {
                   physical_key,
                   logical_key,
                   location: to_location(keycode),
-                  repeat,
+                  // TODO
+                  repeat: false,
                   text: None,
                   platform_specific: KeyEventExtra {},
                 },
@@ -506,18 +493,8 @@ impl<T: 'static> EventLoop<T> {
             h(event);
           }
         }
-        MainEvent::ContentRectChange(content_rect) => {
-          // Propagate as Resized so tauri's resize handler fires and calls
-          // webview.set_bounds() with the new window dimensions.
-          let size = PhysicalSize::new(content_rect.rect.width as _, content_rect.rect.height as _);
-          let event = event::Event::WindowEvent {
-            window_id: window::WindowId(WindowId),
-            event: event::WindowEvent::Resized(size),
-          };
-
-          if let Some(ref mut h) = *self.event_loop.borrow_mut() {
-            h(event);
-          }
+        MainEvent::ContentRectChange { .. } => {
+          warn!("TODO: find a way to notify application of content rect change");
         }
         MainEvent::GainedFocus => {
           HAS_FOCUS.store(true, Ordering::Relaxed);
@@ -575,19 +552,16 @@ impl<T: 'static> EventLoop<T> {
           // self.running = false;
         }
         MainEvent::WindowDestroy => {
-          if let Some(ref mut h) = *self.event_loop.borrow_mut() {
-            let e = event::Event::WindowEvent {
-              window_id: window::WindowId(WindowId),
-              event: event::WindowEvent::CloseRequested,
-            };
-            h(e);
-            // 补发 Destroyed 事件，让 tauri-runtime-wry 可以清理窗口并触发
-            let destroyed = event::Event::WindowEvent {
-              window_id: window::WindowId(WindowId),
-              event: event::WindowEvent::Destroyed,
-            };
-            h(destroyed);
-          }
+          // OHOS window close is fully handled by tauri-runtime-wry's
+          // drain_pending_window_closes, which uses the real OHOS window_id to
+          // find the correct Tauri window and calls on_close_requested →
+          // on_window_close (firing both CloseRequested and Destroyed with the
+          // correct label). We must NOT fire any TaoWindowEvent here — tao's
+          // WindowId is a ZST (same value for all windows), so the
+          // Event::WindowEvent handler's window_id_map.get(&ZST) resolves to the
+          // last-inserted window, which may be a different window than the one
+          // being closed. This caused the main window's webview to be removed
+          // from the manager when a secondary UIAbility window was closed.
         }
         MainEvent::Destroy => {
           if let Some(ref mut h) = *self.event_loop.borrow_mut() {
@@ -740,10 +714,7 @@ impl<T: 'static> EventLoopWindowTarget<T> {
       None => ColorMode::NoSet,
     };
     if let Err(e) = self.app.set_color_mode(color_mode) {
-      log::warn!(
-        "EventLoopWindowTarget::set_theme: failed to call setColorMode: {:?}",
-        e
-      );
+      log::warn!("EventLoopWindowTarget::set_theme: failed to call setColorMode: {:?}", e);
     }
   }
 }
@@ -781,7 +752,9 @@ impl DeviceId {
 /// OHOS window kind: determines whether this window reuses the existing
 /// UIAbility container (UIAbility) or creates a new OS-level floating window (Float).
 ///
-/// Default is UIAbility. Only one UIAbility window can exist (singleton enforced).
+/// All UIAbility windows are equal — no primary/secondary distinction. The first
+/// UIAbility (windowId=0) reuses the existing main container; subsequent UIAbilities
+/// (windowId>0) start a new EntryAbility instance via `context.startAbility`.
 /// Use Float for sub-windows — requires explicit `.ohos_window_kind(Float)` on the builder.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum OHOSWindowKind {
@@ -793,8 +766,8 @@ static UIABILITY_CREATED: AtomicBool = AtomicBool::new(false);
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct PlatformSpecificWindowBuilderAttributes {
-  pub label: Option<String>,
-  pub window_kind: Option<OHOSWindowKind>,
+    pub label: Option<String>,
+    pub window_kind: Option<OHOSWindowKind>,
 }
 
 pub(crate) struct Window {
@@ -806,16 +779,76 @@ pub(crate) struct Window {
   /// AtomicBool supports runtime toggle from arbitrary threads.
   decorations: AtomicBool,
   /// Phase 3: whether window was created with transparent=true.
-  /// Immutable after construction — set_background_color is a no-op when true.
+  /// Immutable after construction. Transparent windows use 0x00000000 at
+  /// creation; runtime set_background_color now also applies color (consistent
+  /// with other platforms).
   transparent: bool,
+  /// 窗口状态镜像。tao 侧维护，OHOS 事件回灌后更新（后续 MainEvent 扩展）。
+  /// 默认 maximized/minimized=false，visible=true，fullscreen=false。
+  maximized: AtomicBool,
+  minimized: AtomicBool,
+  visible: AtomicBool,
+  fullscreen: AtomicBool,
+  /// always_on_top 意图标志（OHOS 无直接 API，仅记录意图，见 set_always_on_top）。
+  always_on_top: AtomicBool,
+  /// 装饰按钮可用性位域。bit0 closable, bit1 maximizable, bit2 minimizable,
+  /// bit3 resizable。默认 0b1111=15（全可用）。
+  decoration_flags: AtomicU8,
 }
+
+/// 装饰按钮位域常量（与 openharmony-ability ArkTS 一致）。
+const FLAG_CLOSABLE: u8 = 1;
+const FLAG_MAXIMIZABLE: u8 = 2;
+const FLAG_MINIMIZABLE: u8 = 4;
+const FLAG_RESIZABLE: u8 = 8;
+const FLAG_ALL_DECORATIONS: u8 = FLAG_CLOSABLE | FLAG_MAXIMIZABLE | FLAG_MINIMIZABLE | FLAG_RESIZABLE;
 
 enum OHOSWindowType {
   TypeApp = 0,
   TypeSystemAlert = 1,
   TypeFloat = 8,
   TypeDialog = 16,
-  TypeMain = 32,
+  TypeMain = 32
+}
+
+/// Maps tao `CursorIcon` to OHOS `pointer.PointerStyle` enum value.
+///
+/// OHOS PointerStyle declaration order (see `@ohos.multimodalInput.pointer`):
+/// DEFAULT=0, EAST=1, WEST=2, SOUTH=3, NORTH=4, WEST_EAST=5, NORTH_SOUTH=6,
+/// NORTH_EAST=7, NORTH_WEST=8, SOUTH_EAST=9, SOUTH_WEST=10,
+/// NORTH_EAST_SOUTH_WEST=11, NORTH_WEST_SOUTH_EAST=12, CROSS=13, CURSOR_COPY=14,
+/// CURSOR_FORBID=15, ..., HAND_GRABBING=17, HAND_OPEN=18, HAND_POINTING=19,
+/// HELP=20, MOVE=21, ..., TEXT_CURSOR=26, ZOOM_IN=27, ZOOM_OUT=28,
+/// HORIZONTAL_TEXT_CURSOR=39, LOADING=42.
+fn ohos_pointer_style(icon: window::CursorIcon) -> i32 {
+  match icon {
+    window::CursorIcon::Default | window::CursorIcon::Arrow | window::CursorIcon::ContextMenu | window::CursorIcon::Cell => 0,
+    window::CursorIcon::Crosshair => 13,
+    window::CursorIcon::Hand => 19,
+    window::CursorIcon::Move | window::CursorIcon::AllScroll => 21,
+    window::CursorIcon::Text => 26,
+    window::CursorIcon::VerticalText => 39,
+    window::CursorIcon::Wait | window::CursorIcon::Progress => 42,
+    window::CursorIcon::Help => 20,
+    window::CursorIcon::NotAllowed | window::CursorIcon::NoDrop => 15,
+    window::CursorIcon::Alias | window::CursorIcon::Copy => 14,
+    window::CursorIcon::Grab => 18,
+    window::CursorIcon::Grabbing => 17,
+    window::CursorIcon::ZoomIn => 27,
+    window::CursorIcon::ZoomOut => 28,
+    window::CursorIcon::EResize => 1,
+    window::CursorIcon::WResize => 2,
+    window::CursorIcon::SResize => 3,
+    window::CursorIcon::NResize => 4,
+    window::CursorIcon::EwResize | window::CursorIcon::ColResize => 5,
+    window::CursorIcon::NsResize | window::CursorIcon::RowResize => 6,
+    window::CursorIcon::NeResize => 7,
+    window::CursorIcon::NwResize => 8,
+    window::CursorIcon::SeResize => 9,
+    window::CursorIcon::SwResize => 10,
+    window::CursorIcon::NeswResize => 11,
+    window::CursorIcon::NwseResize => 12,
+  }
 }
 
 /// Converts tao's RGBA tuple to OHOS `0xAARRGGBB` u32 format.
@@ -830,7 +863,8 @@ fn rgba_to_ohos_color(transparent: bool, bg: Option<window::RGBA>) -> Option<u32
   if transparent {
     Some(0x00000000)
   } else {
-    bg.map(|(r, g, b, a)| ((a as u32) << 24) | ((r as u32) << 16) | ((g as u32) << 8) | (b as u32))
+    bg.map(|(r, g, b, a)|
+      ((a as u32) << 24) | ((r as u32) << 16) | ((g as u32) << 8) | (b as u32))
   }
 }
 
@@ -840,20 +874,20 @@ impl Window {
     window_attrs: window::WindowAttributes,
     pl_attrs: PlatformSpecificWindowBuilderAttributes,
   ) -> Result<Self, error::OsError> {
-    let is_main_window = match pl_attrs.window_kind {
-      Some(OHOSWindowKind::UIAbility) => true,
-      Some(OHOSWindowKind::Float) => false,
-      None => !UIABILITY_CREATED.load(Ordering::SeqCst),
-    };
+    // None defaults to UIAbility — all unspecified windows are UIAbility instances.
+    let kind = pl_attrs.window_kind.unwrap_or(OHOSWindowKind::UIAbility);
 
-    if is_main_window {
-      if UIABILITY_CREATED.swap(true, Ordering::SeqCst) {
-        log::error!("UIAbility window already exists — only one is allowed");
-        return Err(os_error!(OsError));
-      }
+    // The first window must be UIAbility — it reuses the EntryAbility's main
+    // window container (windowId=0). A Float window as the first window is
+    // invalid because there is no UIAbility container to attach to.
+    if !UIABILITY_CREATED.load(Ordering::SeqCst) && kind != OHOSWindowKind::UIAbility {
+      log::error!("First window must be UIAbility, got {:?} — cannot create Float before any UIAbility exists", kind);
+      return Err(os_error!(OsError));
     }
 
-    let window_type = if is_main_window {
+    let is_ui_ability = matches!(kind, OHOSWindowKind::UIAbility);
+
+    let window_type = if is_ui_ability {
       // UIAbility window does not need a window_type
       0
     } else {
@@ -861,29 +895,36 @@ impl Window {
       OHOSWindowType::TypeFloat as i32
     };
 
-    let window_id = if is_main_window {
-      // UIAbility window: reuse the existing main window container (DefaultXComponent).
-      // window_id = 0, wry takes Path 1 (WebViewBuilder).
-      Some(0)
-    } else {
-      // Float window: create a new OS-level floating window via create_os_window.
-      // window_id > 0, wry takes Path 2 (load_url).
-      let label = pl_attrs
-        .label
-        .clone()
-        .unwrap_or_else(|| window_attrs.title.clone());
-      let params = WindowCreateParams {
-        name: label,
-        window_type: window_type as i32,
-        decorations: window_attrs.decorations,
-        transparent: window_attrs.transparent,
-        background_color: rgba_to_ohos_color(
-          window_attrs.transparent,
-          window_attrs.background_color,
-        ),
-        ..WindowCreateParams::default()
-      };
-      create_os_window(params).ok()
+    let window_id = match kind {
+      OHOSWindowKind::UIAbility => {
+        if !UIABILITY_CREATED.swap(true, Ordering::SeqCst) {
+          // First UIAbility: reuse the existing main window container (id=0).
+          Some(0)
+        } else {
+          // Subsequent UIAbility: pre-allocate id, start a new EntryAbility instance.
+          let id = next_window_id();
+          let label = pl_attrs.label.clone().unwrap_or_else(|| window_attrs.title.clone());
+          let url = String::new();
+          if let Err(e) = start_ui_ability(id, label, url, true, window_attrs.transparent) {
+            log::error!("start_ui_ability failed: {:?}", e);
+            return Err(os_error!(OsError));
+          }
+          Some(id)
+        }
+      }
+      OHOSWindowKind::Float => {
+        // Float window: create a new OS-level floating window via create_os_window.
+        let label = pl_attrs.label.clone().unwrap_or_else(|| window_attrs.title.clone());
+        let params = WindowCreateParams {
+          name: label,
+          window_type: window_type as i32,
+          decorations: window_attrs.decorations,
+          transparent: window_attrs.transparent,
+          background_color: rgba_to_ohos_color(window_attrs.transparent, window_attrs.background_color),
+          ..WindowCreateParams::default()
+        };
+        create_os_window(params).ok()
+      }
     };
 
     let win = Self {
@@ -892,13 +933,19 @@ impl Window {
       theme: AtomicU8::new(0),
       decorations: AtomicBool::new(window_attrs.decorations),
       transparent: window_attrs.transparent,
+      maximized: AtomicBool::new(false),
+      minimized: AtomicBool::new(false),
+      visible: AtomicBool::new(true),
+      fullscreen: AtomicBool::new(false),
+      always_on_top: AtomicBool::new(false),
+      decoration_flags: AtomicU8::new(FLAG_ALL_DECORATIONS),
     };
 
     // Apply decorations immediately for the main window at creation time.
     // Without this, the main window retains its default OS decorations even if
     // the builder specified .decorations(false), because Window::set_decorations()
     // is only called later (if at all) by the user.
-    if is_main_window && !window_attrs.decorations {
+    if is_ui_ability && !window_attrs.decorations {
       let _ = set_window_decorations(0, false);
     }
 
@@ -915,6 +962,12 @@ impl Window {
 
   pub fn id(&self) -> WindowId {
     WindowId
+  }
+
+  /// 返回 OHOS window_id（主窗口为 0，Float 子窗口 >0）。
+  /// 用于调用 openharmony-ability 的窗口操作封装。
+  fn ohos_win_id(&self) -> i64 {
+    self.window_id.unwrap_or(0)
   }
 
   pub fn scale_factor(&self) -> f64 {
@@ -934,36 +987,17 @@ impl Window {
     // = window position + content offset relative to window
     // content_rect.left/top is XComponent offset relative to its parent container
     // In OHOS: Screen -> Window -> Container -> XComponent
-    Ok(PhysicalPosition::new(
-      window.left + content.left,
-      window.top + content.top,
-    ))
+    Ok(PhysicalPosition::new(window.left + content.left, window.top + content.top))
   }
 
   pub fn inner_size(&self) -> PhysicalSize<u32> {
-    // On OHOS desktop, win.resize(w, h) sets the OUTER size (including title bar).
-    // Return window_rect (outer) so save→resize cycles are idempotent:
-    // save inner_size (=outer) → restore via resize(outer) → outer unchanged.
-    // The Web component uses .width("100%") (natural layout), so it does not
-    // depend on inner_size for sizing — this change only affects window-state
-    // save/restore and bounds rate calculations (unused for sizing with "100%").
-    let rect = self.app.window_rect();
+    let rect = self.app.content_rect();
     PhysicalSize::new(rect.width as _, rect.height as _)
   }
 
   pub fn set_inner_size(&self, size: Size) {
-    if let Some(window_id) = self.window_id {
-      // OHOS win.resize(w, h) sets the OUTER size. inner_size() returns window_rect
-      // (outer) so save→resize is idempotent on the PhysicalSize path (to_physical is
-      // identity for PhysicalSize). For LogicalSize, convert via the real scale_factor
-      // (a hardcoded 1.0 would halve the window on DPR≠1 displays). The ArkTS side
-      // (WindowManager.resizeWindow) does NOT compensate — it calls win.resize(w, h)
-      // directly, so the value passed here is the outer size.
-      let physical = size.to_physical::<i32>(self.scale_factor());
-      if let Err(e) = resize_window(window_id, physical.width as i64, physical.height as i64) {
-        log::warn!("[tao-ohos] resize_window failed for window {}: {}", window_id, e);
-      }
-    }
+    let s = size.to_physical::<u32>(self.scale_factor());
+    let _ = resize_window(self.ohos_win_id(), s.width as i64, s.height as i64);
   }
   pub fn set_inner_size_constraints(&self, _: WindowSizeConstraints) {}
 
@@ -973,12 +1007,8 @@ impl Window {
   }
 
   pub fn set_outer_position(&self, position: Position) {
-    if let Some(window_id) = self.window_id {
-      let physical = position.to_physical::<i32>(self.scale_factor());
-      if let Err(e) = move_window_to(window_id, physical.x as i64, physical.y as i64) {
-        log::warn!("[tao-ohos] move_window_to failed for window {}: {}", window_id, e);
-      }
-    }
+    let p = position.to_physical::<i32>(self.scale_factor());
+    let _ = move_window_to(self.ohos_win_id(), p.x as i64, p.y as i64);
   }
 
   pub fn outer_size(&self) -> PhysicalSize<u32> {
@@ -1000,53 +1030,17 @@ impl Window {
   pub fn set_title(&self, _title: &str) {}
 
   pub fn set_visible(&self, visibility: bool) {
-    // window_id 0 (main window) is valid for minimize/restore/show/move/resize/maximize
-    // (unlike set_focus/set_focusable, where the main window is OS-managed and guarded
-    // with `window_id > 0`), so no guard here — programmatic minimize on the main window
-    // works (verified on device).
-    //
-    // OHOS has no direct window-hide API, so set_visible(false) uses minimize as a
-    // workaround. Side effect: getWindowStatus() returns MINIMIZE afterwards, so
-    // is_minimized() returns true (unlike Windows/macOS hide, which leaves the
-    // minimized state unchanged). set_visible(true) uses restore (API14) + show_window;
-    // on API12 restore is unavailable → show_window best-effort (may not restore a
-    // minimized main window).
-    if let Some(window_id) = self.window_id {
-      if visibility {
-        if let Err(e) = restore_window(window_id) { log::warn!("[tao-ohos] restore_window failed for window {}: {}", window_id, e); }
-        if let Err(e) = show_window(window_id) { log::warn!("[tao-ohos] show_window failed for window {}: {}", window_id, e); }
-      } else {
-        if let Err(e) = minimize_window(window_id) { log::warn!("[tao-ohos] minimize_window failed for window {}: {}", window_id, e); }
-      }
-    }
+    self.visible.store(visibility, Ordering::Release);
+    let id = self.ohos_win_id();
+    let _ = if visibility { show_window(id) } else { hide_window(id) };
   }
 
   pub fn set_focus(&self) {
-    if let Some(window_id) = self.window_id {
-      if window_id > 0 {
-        if let Err(e) = focus_window(window_id) {
-          warn!(
-            "set_focus: focus_window failed for window {}: {:?}",
-            window_id, e
-          );
-        }
-      }
-      // Main window (window_id = 0): focus is OS-managed, no-op
-    }
+    let _ = focus_window(self.ohos_win_id());
   }
 
   pub fn set_focusable(&self, focusable: bool) {
-    if let Some(window_id) = self.window_id {
-      if window_id > 0 {
-        if let Err(e) = set_window_focusable(window_id, focusable) {
-          warn!(
-            "set_focusable: set_window_focusable failed for window {}: {:?}",
-            window_id, e
-          );
-        }
-      }
-      // Main window (window_id = 0): focusable is OS-managed, no-op
-    }
+    let _ = set_window_focusable(self.ohos_win_id(), focusable);
   }
 
   pub fn is_focused(&self) -> bool {
@@ -1054,75 +1048,74 @@ impl Window {
   }
 
   pub fn is_always_on_top(&self) -> bool {
-    log::warn!("`Window::is_always_on_top` is ignored on OpenHarmony");
-    false
+    self.always_on_top.load(Ordering::Acquire)
   }
 
-  pub fn set_resizable(&self, _resizeable: bool) {
-    warn!("`Window::set_resizable` is ignored on OpenHarmony")
+  pub fn set_resizable(&self, resizable: bool) {
+    self.set_decoration_flag(FLAG_RESIZABLE, resizable);
   }
 
-  pub fn set_minimizable(&self, _minimizable: bool) {
-    warn!("`Window::set_minimizable` is ignored on OpenHarmony")
+  pub fn set_minimizable(&self, minimizable: bool) {
+    self.set_decoration_flag(FLAG_MINIMIZABLE, minimizable);
   }
 
-  pub fn set_maximizable(&self, _maximizable: bool) {
-    warn!("`Window::set_maximizable` is ignored on OpenHarmony")
+  pub fn set_maximizable(&self, maximizable: bool) {
+    self.set_decoration_flag(FLAG_MAXIMIZABLE, maximizable);
   }
 
-  pub fn set_closable(&self, _closable: bool) {
-    warn!("`Window::set_closable` is ignored on OpenHarmony")
+  pub fn set_closable(&self, closable: bool) {
+    self.set_decoration_flag(FLAG_CLOSABLE, closable);
+  }
+
+  /// 公共：更新一个装饰位并派发到 ArkTS（FloatPage LocalStorage）。
+  fn set_decoration_flag(&self, flag: u8, on: bool) {
+    let mut flags = self.decoration_flags.load(Ordering::Acquire);
+    if on { flags |= flag; } else { flags &= !flag; }
+    self.decoration_flags.store(flags, Ordering::Release);
+    let _ = set_window_decoration_flags(self.ohos_win_id(), flags);
   }
 
   pub fn set_minimized(&self, minimized: bool) {
-    if let Some(window_id) = self.window_id {
-      if minimized {
-        if let Err(e) = minimize_window(window_id) { log::warn!("[tao-ohos] minimize_window failed for window {}: {}", window_id, e); }
-      } else {
-        if let Err(e) = restore_window(window_id) { log::warn!("[tao-ohos] restore_window failed for window {}: {}", window_id, e); }
-      }
+    self.minimized.store(minimized, Ordering::Release);
+    let id = self.ohos_win_id();
+    if minimized {
+      let _ = minimize_window(id);
+    } else {
+      let _ = restore_window(id);
     }
   }
 
   pub fn is_minimized(&self) -> bool {
-    if let Some(window_id) = self.window_id {
-      is_window_minimized(window_id).unwrap_or_else(|e| {
-        log::warn!("[tao-ohos] is_window_minimized failed for window {}: {}", window_id, e);
-        false
-      })
-    } else {
-      false
-    }
+    self.minimized.load(Ordering::Acquire)
   }
 
   pub fn set_maximized(&self, maximized: bool) {
-    if let Some(window_id) = self.window_id {
-      if maximized {
-        if let Err(e) = maximize_window(window_id) { log::warn!("[tao-ohos] maximize_window failed for window {}: {}", window_id, e); }
-      } else {
-        // recover() switches MAXIMIZE/FULL_SCREEN → FLOATING (API7+, public)
-        if let Err(e) = recover_window(window_id) { log::warn!("[tao-ohos] recover_window failed for window {}: {}", window_id, e); }
-      }
+    self.maximized.store(maximized, Ordering::Release);
+    let id = self.ohos_win_id();
+    if maximized {
+      let _ = maximize_window(id);
+    } else {
+      let _ = restore_window(id);
     }
   }
 
   pub fn is_maximized(&self) -> bool {
-    if let Some(window_id) = self.window_id {
-      is_window_maximized(window_id).unwrap_or_else(|e| {
-        log::warn!("[tao-ohos] is_window_maximized failed for window {}: {}", window_id, e);
-        false
-      })
-    } else {
-      false
-    }
+    self.maximized.load(Ordering::Acquire)
   }
 
-  pub fn set_fullscreen(&self, _monitor: Option<Fullscreen>) {
-    warn!("Cannot set fullscreen on OpenHarmony");
+  pub fn set_fullscreen(&self, monitor: Option<Fullscreen>) {
+    // OHOS 无独占全屏（Exclusive）概念，统一映射到 Borderless（沉浸式布局）。
+    let on = monitor.is_some();
+    self.fullscreen.store(on, Ordering::Release);
+    let _ = ohos_set_fullscreen(self.ohos_win_id(), on);
   }
 
   pub fn fullscreen(&self) -> Option<Fullscreen> {
-    None
+    if self.fullscreen.load(Ordering::Acquire) {
+      Some(Fullscreen::Borderless(None))
+    } else {
+      None
+    }
   }
 
   pub fn set_decorations(&self, decorations: bool) {
@@ -1133,7 +1126,15 @@ impl Window {
   }
   pub fn set_always_on_bottom(&self, _always_on_bottom: bool) {}
 
-  pub fn set_always_on_top(&self, _always_on_top: bool) {}
+  pub fn set_always_on_top(&self, always_on_top: bool) {
+    // OHOS 无跨窗口 z-order 公开 API。Float 子窗口天然浮于主窗口之上；
+    // 主 UIAbility 窗口的置顶由系统管理。此处仅记录意图，is_always_on_top 据此返回。
+    // 后续若 OHOS 开放 setWindowType/z-level API，在此接入 openharmony-ability 封装。
+    self.always_on_top.store(always_on_top, Ordering::Release);
+    if always_on_top {
+      log::warn!("`Window::set_always_on_top(true)` recorded but not enforced on OpenHarmony (no z-order API)");
+    }
+  }
   pub fn set_ime_position(&self, _position: Position) {}
 
   pub fn is_decorated(&self) -> bool {
@@ -1141,33 +1142,34 @@ impl Window {
   }
 
   pub fn is_visible(&self) -> bool {
-    log::warn!("`Window::is_visible` is ignored on OpenHarmony");
-    false
+    self.visible.load(Ordering::Acquire)
   }
 
   pub fn is_resizable(&self) -> bool {
-    warn!("`Window::is_resizable` is ignored on OpenHarmony");
-    false
+    self.decoration_flags.load(Ordering::Acquire) & FLAG_RESIZABLE != 0
   }
 
   pub fn is_minimizable(&self) -> bool {
-    warn!("`Window::is_minimizable` is ignored on OpenHarmony");
-    false
+    self.decoration_flags.load(Ordering::Acquire) & FLAG_MINIMIZABLE != 0
   }
 
   pub fn is_maximizable(&self) -> bool {
-    warn!("`Window::is_maximizable` is ignored on OpenHarmony");
-    false
+    self.decoration_flags.load(Ordering::Acquire) & FLAG_MAXIMIZABLE != 0
   }
 
   pub fn is_closable(&self) -> bool {
-    warn!("`Window::is_closable` is ignored on OpenHarmony");
-    false
+    self.decoration_flags.load(Ordering::Acquire) & FLAG_CLOSABLE != 0
   }
 
   pub fn set_window_icon(&self, _window_icon: Option<crate::icon::Icon>) {}
 
-  pub fn set_cursor_icon(&self, _: window::CursorIcon) {}
+  pub fn set_cursor_icon(&self, icon: window::CursorIcon) {
+    // 按 windowId 设置光标样式（pointer.setPointerStyleSync）。
+    let style = ohos_pointer_style(icon);
+    if let Err(e) = set_pointer_style(self.ohos_win_id(), style) {
+      log::warn!("set_cursor_icon failed to dispatch: {:?}", e);
+    }
+  }
   pub fn set_cursor_grab(&self, _: bool) -> Result<(), error::ExternalError> {
     Err(error::ExternalError::NotSupported(
       error::NotSupportedError::new(),
@@ -1188,14 +1190,24 @@ impl Window {
     Ok(PhysicalPosition::new(x, y))
   }
 
-  pub fn set_ignore_cursor_events(&self, _ignore: bool) -> Result<(), error::ExternalError> {
-    Err(error::ExternalError::NotSupported(
-      error::NotSupportedError::new(),
-    ))
+  pub fn set_ignore_cursor_events(&self, ignore: bool) -> Result<(), error::ExternalError> {
+    // tao 语义：ignore=true 表示忽略光标事件（点击穿透）。
+    // OHOS setWindowTouchable：touchable=true 可触摸，false 穿透。故 touchable = !ignore。
+    if let Err(e) = set_window_touchable(self.ohos_win_id(), !ignore) {
+      log::warn!("set_ignore_cursor_events failed to dispatch: {:?}", e);
+    }
+    Ok(())
   }
 
-  pub fn set_cursor_visible(&self, _: bool) {}
+  pub fn set_cursor_visible(&self, visible: bool) {
+    // 全局光标显隐（@ohos.multimodalInput.pointer.setPointerVisible）。
+    if let Err(e) = set_pointer_visible(visible) {
+      log::warn!("set_cursor_visible failed to dispatch: {:?}", e);
+    }
+  }
   pub fn drag_window(&self) -> Result<(), error::ExternalError> {
+    // OHOS SDK 无 startWindowMove 公开 API。Float 子窗口拖拽由 FloatPage
+    // PanGesture 手柄处理（UI 层），不通过该编程式 API 暴露。
     Err(error::ExternalError::NotSupported(
       error::NotSupportedError::new(),
     ))
@@ -1205,18 +1217,21 @@ impl Window {
     &self,
     _direction: ResizeDirection,
   ) -> Result<(), error::ExternalError> {
+    // OHOS SDK 无 startWindowResize / Direction 枚举。同 A3，由 FloatPage 手柄处理。
     Err(error::ExternalError::NotSupported(
       error::NotSupportedError::new(),
     ))
   }
 
   pub fn set_background_color(&self, color: Option<crate::window::RGBA>) {
-    // Respect transparent flag: silently ignore background_color when transparent=true,
-    // consistent with creation-time behavior and P3 spec.
-    if self.transparent {
-      log::debug!("[tao-ohos] set_background_color ignored: window is transparent");
-      return;
-    }
+    // 与 macOS/Windows/Linux 一致：transparent 窗口也允许运行时改背景色。
+    // 不再因 transparent 拦截（commit 7963af3a 误加的拦截与 commit message 矛盾，
+    // 且其他平台均不拦截 transparent 窗口的 set_background_color）。
+    log::info!(
+      "[tao-ohos] set_background_color: transparent={}, color={:?}",
+      self.transparent,
+      color
+    );
     let color_u32 = rgba_to_ohos_color(false, color).unwrap_or(0xFFFFFFFF);
     if let Some(window_id) = self.window_id {
       let _ = set_window_background_color(window_id, color_u32);
@@ -1238,13 +1253,10 @@ impl Window {
     };
     // Store the resolved theme; None → Light (default)
     let stored = theme.unwrap_or(Theme::Light);
-    self.theme.store(
-      match stored {
-        Theme::Dark => 1,
-        Theme::Light => 0,
-      },
-      Ordering::Relaxed,
-    );
+    self.theme.store(match stored {
+      Theme::Dark => 1,
+      Theme::Light => 0,
+    }, Ordering::Relaxed);
     // If theme is None, follow system → NoSet
     let color_mode = match theme {
       Some(_) => color_mode,
@@ -1410,4 +1422,40 @@ pub fn keycode_to_scancode(_code: KeyCode) -> Option<u32> {
 
 pub fn keycode_from_scancode(_scancode: u32) -> KeyCode {
   KeyCode::Unidentified(NativeKeyCode::Unidentified)
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  /// rgba_to_ohos_color：透明优先，否则打包 0xAARRGGBB。
+  #[test]
+  fn rgba_color_packing() {
+    assert_eq!(rgba_to_ohos_color(true, None), Some(0x00000000));
+    assert_eq!(rgba_to_ohos_color(true, Some((255, 0, 0, 255))), Some(0x00000000));
+    // 不透明红：R=255,G=0,B=0,A=255 → 0xFFFF0000
+    assert_eq!(rgba_to_ohos_color(false, Some((255, 0, 0, 255))), Some(0xFFFF0000));
+    // 半透明：A=0x80
+    assert_eq!(rgba_to_ohos_color(false, Some((0, 0, 0, 0x80))), Some(0x80000000));
+    assert_eq!(rgba_to_ohos_color(false, None), None);
+  }
+
+  ///  tao CursorIcon → OHOS PointerStyle 数值映射。
+  #[test]
+  fn cursor_icon_mapping() {
+    use crate::window::CursorIcon;
+    assert_eq!(ohos_pointer_style(CursorIcon::Default), 0);
+    assert_eq!(ohos_pointer_style(CursorIcon::Crosshair), 13);
+    assert_eq!(ohos_pointer_style(CursorIcon::Hand), 19);
+    assert_eq!(ohos_pointer_style(CursorIcon::Text), 26);
+    assert_eq!(ohos_pointer_style(CursorIcon::Wait), 42);
+    assert_eq!(ohos_pointer_style(CursorIcon::NotAllowed), 15);
+    assert_eq!(ohos_pointer_style(CursorIcon::Copy), 14);
+    assert_eq!(ohos_pointer_style(CursorIcon::Grab), 18);
+    assert_eq!(ohos_pointer_style(CursorIcon::Grabbing), 17);
+    assert_eq!(ohos_pointer_style(CursorIcon::ZoomIn), 27);
+    assert_eq!(ohos_pointer_style(CursorIcon::EResize), 1);
+    assert_eq!(ohos_pointer_style(CursorIcon::EwResize), 5);
+    assert_eq!(ohos_pointer_style(CursorIcon::NwseResize), 12);
+  }
 }
