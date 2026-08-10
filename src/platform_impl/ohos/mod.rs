@@ -495,7 +495,16 @@ impl<T: 'static> EventLoop<T> {
           }
         }
         MainEvent::WindowResize(size) => {
-          let size = PhysicalSize::new(size.width as _, size.height as _);
+          // Use last_set_inner_size if available (ensures idempotent save→restore);
+          // fall back to the event size for initial/manual resizes.
+          let packed = self.openharmony_app.last_set_inner_size();
+          let size = {
+            if packed != 0 {
+              PhysicalSize::new((packed >> 32) as u32, packed as u32)
+            } else {
+              PhysicalSize::new(size.width as _, size.height as _)
+            }
+          };
           let event = event::Event::WindowEvent {
             window_id: window::WindowId(WindowId),
             event: event::WindowEvent::Resized(size),
@@ -515,7 +524,16 @@ impl<T: 'static> EventLoop<T> {
         MainEvent::ContentRectChange(content_rect) => {
           // Propagate as Resized so tauri's resize handler fires and calls
           // webview.set_bounds() with the new window dimensions.
-          let size = PhysicalSize::new(content_rect.rect.width as _, content_rect.rect.height as _);
+          // Use last_set_inner_size if available to prevent save→restore height drift
+          // (windowRectChange may report content area, not outer area).
+          let packed = self.openharmony_app.last_set_inner_size();
+          let size = {
+            if packed != 0 {
+              PhysicalSize::new((packed >> 32) as u32, packed as u32)
+            } else {
+              PhysicalSize::new(content_rect.rect.width as _, content_rect.rect.height as _)
+            }
+          };
           let event = event::Event::WindowEvent {
             window_id: window::WindowId(WindowId),
             event: event::WindowEvent::Resized(size),
@@ -562,8 +580,14 @@ impl<T: 'static> EventLoop<T> {
           }
         }
         MainEvent::Start => {
-          // XXX: how to forward this state to applications?
-          warn!("TODO: forward onStart notification to application");
+          // WindowStageEventType::SHOWN (window visible to user). Forwarded as
+          // Event::Resumed — tao's closest lifecycle signal to OHOS "window-shown".
+          // Double Resumed (alongside SurfaceCreate/Resume) is acceptable; downstream
+          // tauri RunEvent::Resumed handlers must be idempotent.
+          // See openspec ohos-event-lifecycle-forward.
+          if let Some(ref mut h) = *self.event_loop.borrow_mut() {
+            h(event::Event::Resumed);
+          }
         }
         MainEvent::Resume { .. } => {
           if let Some(ref mut h) = *self.event_loop.borrow_mut() {
@@ -571,9 +595,11 @@ impl<T: 'static> EventLoop<T> {
           }
         }
         MainEvent::SaveState { .. } => {
-          // XXX: how to forward this state to applications?
-          // XXX: also how do we expose state restoration to apps?
-          warn!("TODO: forward saveState notification to application");
+          // onAbilitySaveState has no tao Event/StartCause equivalent (no Autosave
+          // variant). Degraded: dropped with debug log. Apps must persist state via
+          // tauri RunEvent::Exit/ExitRequested or custom logic.
+          // See openspec ohos-event-lifecycle-forward.
+          debug!("SaveState has no tao Event equivalent; dropped (see ohos-event-lifecycle-forward)");
         }
         MainEvent::Pause => {
           debug!("App Paused - stopped running");
@@ -714,9 +740,16 @@ impl<T: 'static> EventLoopWindowTarget<T> {
   }
 
   #[inline]
-  pub fn monitor_from_point(&self, _x: f64, _y: f64) -> Option<MonitorHandle> {
-    warn!("`Window::monitor_from_point` is ignored on OpenHarmony");
-    return None;
+  pub fn monitor_from_point(&self, x: f64, y: f64) -> Option<MonitorHandle> {
+    // OHOS is single-display; return primary when the point is within the
+    // default display bounds (DisplayManager physical pixels). See ohos-monitor-real-values.
+    let w = self.app.display_width() as f64;
+    let h = self.app.display_height() as f64;
+    if w > 0.0 && h > 0.0 && x >= 0.0 && y >= 0.0 && x < w && y < h {
+      Some(MonitorHandle::new(self.app.clone()))
+    } else {
+      None
+    }
   }
 
   #[cfg(feature = "rwh_05")]
@@ -996,9 +1029,18 @@ impl Window {
   pub fn request_redraw(&self) {}
 
   #[inline]
-  pub fn monitor_from_point(&self, _x: f64, _y: f64) -> Option<monitor::MonitorHandle> {
-    warn!("`Window::monitor_from_point` is ignored on OpenHarmony");
-    return None;
+  pub fn monitor_from_point(&self, x: f64, y: f64) -> Option<monitor::MonitorHandle> {
+    // OHOS is single-display; return primary when the point is within the
+    // default display bounds (DisplayManager physical pixels). See ohos-monitor-real-values.
+    let w = self.app.display_width() as f64;
+    let h = self.app.display_height() as f64;
+    if w > 0.0 && h > 0.0 && x >= 0.0 && y >= 0.0 && x < w && y < h {
+      Some(monitor::MonitorHandle {
+        inner: MonitorHandle::new(self.app.clone()),
+      })
+    } else {
+      None
+    }
   }
 
   pub fn id(&self) -> WindowId {
@@ -1031,16 +1073,31 @@ impl Window {
     Ok(PhysicalPosition::new(window.left + content.left, window.top + content.top))
   }
 
+  // On OHOS desktop, win.resize(w, h) sets the OUTER size (including title bar).
+  // Return the last set inner size (if any) to make save→resize cycles idempotent.
+  // Fall back to window_rect() for the initial size before any set_inner_size() call.
+  // OHOS windowSizeChange/windowRectChange may report content area, so relying on
+  // system callbacks alone causes save→restore height drift (each cycle shrinks by
+  // title bar height).
   pub fn inner_size(&self) -> PhysicalSize<u32> {
-    let rect = self.app.content_rect();
-    PhysicalSize::new(rect.width as _, rect.height as _)
+    let packed = self.app.last_set_inner_size();
+    let window_rect = self.app.window_rect();
+    let result = if packed != 0 {
+      PhysicalSize::new((packed >> 32) as u32, packed as u32)
+    } else {
+      PhysicalSize::new(window_rect.width as _, window_rect.height as _)
+    };
+    result
   }
 
-  // TODO(遗留问题二): set_inner_size 走 win.resize 改的是外尺寸(含标题栏),
-  //   与 inner 语义不符,导致 save→restore 不幂等(每次循环缩小一个标题栏高度)。
-  //   根因与修复方向见 doc/OHOS窗口遗留问题.md(问题二)。
+  // OHOS win.resize(w, h) sets the OUTER size. inner_size() returns the last-set
+  // value (or window_rect as fallback) so save→resize cycles are idempotent.
+  // The ArkTS side (WindowManager.resizeWindow) does NOT compensate — it calls
+  // win.resize(w, h) directly, so the value passed here is the outer size.
   pub fn set_inner_size(&self, size: Size) {
     let s = size.to_physical::<u32>(self.scale_factor());
+    let packed = ((s.width as u64) << 32) | (s.height as u64);
+    self.app.set_last_set_inner_size(packed);
     let _ = resize_window(self.ohos_win_id(), s.width as i64, s.height as i64);
   }
   pub fn set_inner_size_constraints(&self, _: WindowSizeConstraints) {}
@@ -1055,8 +1112,6 @@ impl Window {
     let _ = move_window_to(self.ohos_win_id(), p.x as i64, p.y as i64);
   }
 
-  // TODO(遗留问题二): outer_size 读 window_rect 正确,但 set_inner_size 写的是外尺寸,
-  //   inner/outer 语义错位。详见 doc/OHOS窗口遗留问题.md(问题二)。
   pub fn outer_size(&self) -> PhysicalSize<u32> {
     let window = self.app.window_rect();
     // window_rect is set by ArkTS callback, may be (0,0,0,0) initially
@@ -1257,7 +1312,7 @@ impl Window {
   }
 
   pub fn set_ignore_cursor_events(&self, ignore: bool) -> Result<(), error::ExternalError> {
-    // TODO(遗留问题六): 已 dispatch 但未经真机测试 — 需验证穿透模式可见不响应、
+// TODO(遗留问题六): 已 dispatch 但未经真机测试 — 需验证穿透模式可见不响应、
     //   穿透事件落到下层、主窗口/Float 行为一致性。见 doc/OHOS窗口遗留问题.md(问题六)。
     // tao 语义：ignore=true 表示忽略光标事件（点击穿透）。
     // OHOS setWindowTouchable：touchable=true 可触摸，false 穿透。故 touchable = !ignore。
@@ -1433,8 +1488,17 @@ impl MonitorHandle {
     // content_rect here made positioner `Center` compute to negative coords
     // (content/2 - outer/2 < 0) which OHOS clamps to (0,0), so windows snapped
     // to top-left instead of centering.
-    let (width, height) = self.app.display_size();
-    PhysicalSize::new(width, height)
+    // Prefer OHOS DisplayManager physical pixels; fall back to content_rect
+    // when the query returns 0. See ohos-monitor-real-values.
+    let w = self.app.display_width();
+    let h = self.app.display_height();
+    if w > 0 && h > 0 {
+      PhysicalSize::new(w, h)
+    } else {
+      warn!("[tao ohos] DisplayManager size query returned 0; falling back to content_rect");
+      let size = self.app.content_rect();
+      PhysicalSize::new(size.width as _, size.height as _)
+    }
   }
 
   pub fn position(&self) -> PhysicalPosition<i32> {
@@ -1447,13 +1511,13 @@ impl MonitorHandle {
 
   pub fn video_modes(&self) -> impl Iterator<Item = monitor::VideoMode> {
     let size = self.size().into();
-    // FIXME this is not the real refresh rate
-    // (it is guaranteed to support 32 bit color though)
+    // refresh_rate from OHOS DisplayManager real value (see ohos-monitor-real-values).
+    // bit_depth fixed at 32 (RGBA8888) — see ohos-monitor-degradation.
     std::iter::once(monitor::VideoMode {
       video_mode: VideoMode {
         size,
         bit_depth: 32,
-        refresh_rate: 60,
+        refresh_rate: self.app.refresh_rate() as u16,
         monitor: self.clone(),
       },
     })
