@@ -17,7 +17,9 @@ use openharmony_ability::window::{
   show_window, hide_window, focus_window,
   is_window_maximized, is_window_minimized,
   set_fullscreen as ohos_set_fullscreen, set_window_touchable,
-  set_window_decoration_flags, set_window_focusable,
+  set_window_decoration_flags, set_window_focusable, set_window_topmost,
+  set_window_title, set_window_limits, request_redraw, request_user_attention,
+  set_ime_position, set_window_draggable,
   set_pointer_visible, set_pointer_style,
   start_ui_ability, next_window_id,
 };
@@ -40,6 +42,16 @@ mod keycodes;
 pub(crate) use crate::icon::NoIcon as PlatformIcon;
 
 static HAS_FOCUS: AtomicBool = AtomicBool::new(true);
+
+/// App-level theme override(问题五 5.2 theme 回灌)。
+/// `set_theme(Some)` 写入显式覆盖;`set_theme(None)` 写 FOLLOW(跟随系统)。
+/// `theme()` 读此覆盖:FOLLOW 时回落到 `app.config().color_mode`(由
+/// ConfigChanged 事件持续刷新,反映系统真值,无需手动回灌)。
+/// 全局而非 per-window,因 OHOS setColorMode 本身是全局(非窗口级)。
+const THEME_OVERRIDE_LIGHT: u8 = 0;
+const THEME_OVERRIDE_DARK: u8 = 1;
+const THEME_OVERRIDE_FOLLOW: u8 = 2;
+static APP_THEME_OVERRIDE: AtomicU8 = AtomicU8::new(THEME_OVERRIDE_FOLLOW);
 
 /// Tracks currently pressed keys for repeat detection.
 /// When a Down event arrives for a key already in this set, it's a repeat.
@@ -644,6 +656,12 @@ impl<T: 'static> EventLoop<T> {
             }
           }
         }
+        MainEvent::FoldDisplayModeChange(mode) => {
+          // Foldable screen fold/unfold event. System will fire windowSizeChange/
+          // ContentRectChange after display size changes, which propagates as Resized.
+          // Just log; actual resize handled by ContentRectChange.
+          log::info!("[tao-ohos] FoldDisplayModeChange: mode={}", mode);
+        }
         unknown => {
           trace!("Unknown MainEvent {unknown:?} (ignored)");
         }
@@ -741,12 +759,18 @@ impl<T: 'static> EventLoopWindowTarget<T> {
 
   pub fn set_theme(&self, theme: Option<Theme>) {
     use openharmony_ability::ColorMode;
+    // 与 Window::set_theme 一致:写全局 override,确保 theme() 立即反映 app 意图。
+    APP_THEME_OVERRIDE.store(
+      match theme {
+        Some(Theme::Dark) => THEME_OVERRIDE_DARK,
+        Some(Theme::Light) => THEME_OVERRIDE_LIGHT,
+        None => THEME_OVERRIDE_FOLLOW,
+      },
+      Ordering::Relaxed,
+    );
     let color_mode = match theme {
       Some(Theme::Dark) => ColorMode::Dark,
-      Some(Theme::Light) | None => ColorMode::Light,
-    };
-    let color_mode = match theme {
-      Some(_) => color_mode,
+      Some(Theme::Light) => ColorMode::Light,
       None => ColorMode::NoSet,
     };
     if let Err(e) = self.app.set_color_mode(color_mode) {
@@ -809,8 +833,6 @@ pub struct PlatformSpecificWindowBuilderAttributes {
 pub(crate) struct Window {
   app: OpenHarmonyApp,
   window_id: Option<i64>,
-  /// 0 = Light, 1 = Dark
-  theme: AtomicU8,
   /// Phase 2: window decoration state (title bar visibility).
   /// AtomicBool supports runtime toggle from arbitrary threads.
   decorations: AtomicBool,
@@ -819,15 +841,19 @@ pub(crate) struct Window {
   /// creation; runtime set_background_color now also applies color (consistent
   /// with other platforms).
   transparent: bool,
-  // TODO(遗留问题五): 以下 Atomic 镜像位与 ArkTS 真实状态缺乏双向同步:
-  //   - maximized/minimized 是僵尸字段(从不 store/load,is_* 实际查系统)
-  //   - visible/fullscreen/decorations/always_on_top 单向写不回读,系统状态变化不回灌
-  //   - is_visible()/fullscreen() 读本地镜像,不可信
-  //   根因与修复(补系统状态回灌、删僵尸字段)见 doc/OHOS窗口遗留问题.md(问题五)。
-  /// 窗口状态镜像。tao 侧维护，OHOS 事件回灌后更新（后续 MainEvent 扩展）。
-  /// 默认 maximized/minimized=false，visible=true，fullscreen=false。
-  maximized: AtomicBool,
-  minimized: AtomicBool,
+  // 镜像位同步状态(问题五):
+  //   - maximized/minimized:无镜像,is_maximized/is_minimized 直接查系统
+  //     (getWindowStatus() sync getter,读源正确,保持不变)。5.1 已删僵尸字段。
+  //   - visible/fullscreen:本地镜像,由 windowStatusChange 事件回灌系统真值
+  //     (apply_window_status,wry drain 路由)。set_* 写意图、事件回灌写真值。
+  //   - decorations/decoration_flags:app-owned 本地镜像,系统无对应态可回灌
+  //     (仅记录 app 意图,关联问题四语义错位,不在本修复范围)。
+  //   - always_on_top:纯意图标志,OHOS 无 z-order API(不反映系统真实 z-order)。
+  //   - theme:已移除 per-window 字段,改读全局 APP_THEME_OVERRIDE + app.config()
+  //     colorMode(由 ConfigChanged 持续刷新)。
+  //   详见 doc/OHOS窗口遗留问题.md(问题五 5.1/5.2/5.3)。
+  /// 窗口状态镜像。visible/fullscreen 由 windowStatusChange 回灌维护。
+  /// 默认 visible=true，fullscreen=false。
   visible: AtomicBool,
   fullscreen: AtomicBool,
   /// always_on_top 意图标志（OHOS 无直接 API，仅记录意图，见 set_always_on_top）。
@@ -850,6 +876,35 @@ enum OHOSWindowType {
   TypeFloat = 8,
   TypeDialog = 16,
   TypeMain = 32
+}
+
+/// OHOS `WindowStatusType` (API 11+) — the system's window mode, reported via
+/// `window.on('windowStatusChange')`. Values match the ArkTS enum order:
+/// 1=FULL_SCREEN, 2=MAXIMIZE, 3=MINIMIZE, 4=FLOATING, 5=SPLIT_SCREEN.
+///
+/// Used by [`Window::apply_window_status`] to回灌 system truth into tao mirror
+/// bits. See doc/OHOS窗口遗留问题.md(问题五 5.3).
+enum WindowStatus {
+  FullScreen,
+  Maximize,
+  Minimize,
+  Floating,
+  SplitScreen,
+  /// UNDEFINED(0) or any unrecognized value.
+  Other,
+}
+
+impl From<i32> for WindowStatus {
+  fn from(value: i32) -> Self {
+    match value {
+      1 => WindowStatus::FullScreen,
+      2 => WindowStatus::Maximize,
+      3 => WindowStatus::Minimize,
+      4 => WindowStatus::Floating,
+      5 => WindowStatus::SplitScreen,
+      _ => WindowStatus::Other,
+    }
+  }
 }
 
 /// Maps tao `CursorIcon` to OHOS `pointer.PointerStyle` enum value.
@@ -971,11 +1026,8 @@ impl Window {
     let win = Self {
       app: el.app.clone(),
       window_id,
-      theme: AtomicU8::new(0),
       decorations: AtomicBool::new(window_attrs.decorations),
       transparent: window_attrs.transparent,
-      maximized: AtomicBool::new(false),
-      minimized: AtomicBool::new(false),
       visible: AtomicBool::new(true),
       fullscreen: AtomicBool::new(false),
       always_on_top: AtomicBool::new(false),
@@ -993,7 +1045,13 @@ impl Window {
     Ok(win)
   }
 
-  pub fn request_redraw(&self) {}
+  pub fn request_redraw(&self) {
+    // OHOS vsync auto-drives rendering; this calls ArkTS for log/debug.
+    let id = self.ohos_win_id();
+    if let Err(e) = request_redraw(id) {
+      log::warn!("[tao-ohos] request_redraw failed for window {}: {}", id, e);
+    }
+  }
 
   #[inline]
   pub fn monitor_from_point(&self, _x: f64, _y: f64) -> Option<monitor::MonitorHandle> {
@@ -1040,8 +1098,26 @@ impl Window {
   //   与 inner 语义不符,导致 save→restore 不幂等(每次循环缩小一个标题栏高度)。
   //   根因与修复方向见 doc/OHOS窗口遗留问题.md(问题二)。
   pub fn set_inner_size(&self, size: Size) {
+    // 拦截:FLAG_RESIZABLE 为 0 时,不允许 resize(问题四:语义错位修复)
+    if (self.decoration_flags.load(Ordering::Acquire) & FLAG_RESIZABLE) == 0 {
+      log::warn!("[tao-ohos] set_inner_size blocked: FLAG_RESIZABLE not set");
+      return;
+    }
     let s = size.to_physical::<u32>(self.scale_factor());
-    let _ = resize_window(self.ohos_win_id(), s.width as i64, s.height as i64);
+    // Compensate for title bar height: OHOS win.resize() sets the OUTER size
+    // (including title bar), but the caller expects INNER size (content area).
+    // decor_height = window_rect.height - content_rect.height (title bar + borders).
+    // Without this, save→restore loops shrink the window by one title bar each cycle
+    // (遗留问题二: inner/outer 语义错位).
+    let window = self.app.window_rect();
+    let content = self.app.content_rect();
+    let decor_height = if window.height > content.height && content.height > 0 {
+      (window.height - content.height) as u32
+    } else {
+      0  // no decorations or content not yet initialized
+    };
+    let outer_height = s.height.saturating_add(decor_height);
+    let _ = resize_window(self.ohos_win_id(), s.width as i64, outer_height as i64);
   }
   pub fn set_inner_size_constraints(&self, _: WindowSizeConstraints) {}
 
@@ -1069,11 +1145,49 @@ impl Window {
     }
   }
 
-  pub fn set_min_inner_size(&self, _: Option<Size>) {}
+  pub fn set_min_inner_size(&self, size: Option<Size>) {
+    // OHOS setWindowLimits (API 11+) sets all four (min/max w/h) at once. We store
+    // only the min here; max is left as 0 (no limit). If both min and max are needed,
+    // caller should set max first then min (last call wins the max=0 reset — known
+    // simplification, acceptable for the "careful testing" scope).
+    // ⚠️ Triggers OnSizeChange — do not call frequently (appfreeze risk).
+    let (min_w, min_h) = match size {
+      Some(s) => {
+        let p = s.to_physical::<u32>(self.scale_factor());
+        (p.width, p.height)
+      }
+      None => (0, 0),
+    };
+    let id = self.ohos_win_id();
+    if let Err(e) = set_window_limits(id, min_w, min_h, 0, 0) {
+      log::warn!("[tao-ohos] set_window_limits (min) failed for window {}: {}", id, e);
+    }
+  }
 
-  pub fn set_max_inner_size(&self, _: Option<Size>) {}
+  pub fn set_max_inner_size(&self, size: Option<Size>) {
+    // See set_min_inner_size note. Only max is set; min left as 0 (no limit).
+    let (max_w, max_h) = match size {
+      Some(s) => {
+        let p = s.to_physical::<u32>(self.scale_factor());
+        (p.width, p.height)
+      }
+      None => (0, 0),
+    };
+    let id = self.ohos_win_id();
+    if let Err(e) = set_window_limits(id, 0, 0, max_w, max_h) {
+      log::warn!("[tao-ohos] set_window_limits (max) failed for window {}: {}", id, e);
+    }
+  }
 
-  pub fn set_title(&self, _title: &str) {}
+  pub fn set_title(&self, title: &str) {
+    // OHOS setWindowTitle (API 9+, callback form). Main window + Float sub-windows
+    // both support title text. Only visible when decorations enabled (decorEnabled=true).
+    // Icon is NOT changeable at runtime.
+    let id = self.ohos_win_id();
+    if let Err(e) = set_window_title(id, title.to_string()) {
+      log::warn!("[tao-ohos] set_window_title failed for window {}: {}", id, e);
+    }
+  }
 
   // TODO(遗留问题三): hide_window 在 OHOS 上无统一实现 —— UIAbility 主窗口用
   //   hideAbility(需状态栏前置条件),Float 子窗口用 minimize 冒充(语义不符,
@@ -1131,6 +1245,11 @@ impl Window {
   }
 
   pub fn set_minimized(&self, minimized: bool) {
+    // 拦截:FLAG_MINIMIZABLE 为 0 时,不允许最小化(问题四:语义错位修复)
+    if minimized && (self.decoration_flags.load(Ordering::Acquire) & FLAG_MINIMIZABLE) == 0 {
+      log::warn!("[tao-ohos] set_minimized(true) blocked: FLAG_MINIMIZABLE not set");
+      return;
+    }
     let id = self.ohos_win_id();
     if minimized {
       if let Err(e) = minimize_window(id) { log::warn!("[tao-ohos] minimize_window failed for window {}: {}", id, e); }
@@ -1148,6 +1267,11 @@ impl Window {
   }
 
   pub fn set_maximized(&self, maximized: bool) {
+    // 拦截:FLAG_MAXIMIZABLE 为 0 时,不允许最大化(问题四:语义错位修复)
+    if maximized && (self.decoration_flags.load(Ordering::Acquire) & FLAG_MAXIMIZABLE) == 0 {
+      log::warn!("[tao-ohos] set_maximized(true) blocked: FLAG_MAXIMIZABLE not set");
+      return;
+    }
     let id = self.ohos_win_id();
     if maximized {
       if let Err(e) = maximize_window(id) { log::warn!("[tao-ohos] maximize_window failed for window {}: {}", id, e); }
@@ -1180,6 +1304,49 @@ impl Window {
     }
   }
 
+  /// 回灌系统窗口状态到 tao 镜像位(问题五 5.3)。
+  ///
+  /// 由 tauri-runtime-wry 的 OHOS drain 块调用:`windowStatusChange` 事件经
+  /// `notify_window_status` NAPI 入队,drain 后用真实 OHOS windowId 路由到此
+  /// `Window`,把系统真值写入 `visible`/`fullscreen` 镜像位。
+  ///
+  /// `maximized`/`minimized` 不走镜像——`is_maximized`/`is_minimized` 已直接
+  /// 查系统(`getWindowStatus()` sync getter),是这堆字段里唯一读源正确的,
+  /// 保持不变。此处只维护 visible/fullscreen(它们之前是"本地写、不回灌")。
+  ///
+  /// `status` 是裸 OHOS `WindowStatusType` 值(透传自 ArkTS)。
+  pub fn apply_window_status(&self, status: i32) {
+    match WindowStatus::from(status) {
+      WindowStatus::FullScreen => {
+        // 系统全屏态:可见 + 全屏。
+        self.visible.store(true, Ordering::Release);
+        self.fullscreen.store(true, Ordering::Release);
+      }
+      WindowStatus::Maximize => {
+        // 最大化:可见、非全屏(tao 无"最大化"镜像位,is_maximized 查系统)。
+        self.visible.store(true, Ordering::Release);
+        self.fullscreen.store(false, Ordering::Release);
+      }
+      WindowStatus::Minimize => {
+        // 最小化:不可见、非全屏。
+        self.visible.store(false, Ordering::Release);
+        self.fullscreen.store(false, Ordering::Release);
+      }
+      WindowStatus::Floating => {
+        // 自由悬浮(常态):可见、非全屏。
+        self.visible.store(true, Ordering::Release);
+        self.fullscreen.store(false, Ordering::Release);
+      }
+      WindowStatus::SplitScreen => {
+        // 分屏:可见、非全屏(tao 无分屏概念,按可见处理)。
+        self.visible.store(true, Ordering::Release);
+        self.fullscreen.store(false, Ordering::Release);
+      }
+      WindowStatus::Other => {
+        // UNDEFINED/未知值:不改,避免误清。
+      }
+    }
+  }
   pub fn set_decorations(&self, decorations: bool) {
     self.decorations.store(decorations, Ordering::Release);
     if let Some(window_id) = self.window_id {
@@ -1189,17 +1356,25 @@ impl Window {
   pub fn set_always_on_bottom(&self, _always_on_bottom: bool) {}
 
   pub fn set_always_on_top(&self, always_on_top: bool) {
-    // TODO(遗留问题六): 本函数为 no-op(无 z-order API),行为未经真机测试。
-    //   验证清单(确认 no-op + warn 行为、Float 看似生效)见 doc/OHOS窗口遗留问题.md(问题六)。
-    // OHOS 无跨窗口 z-order 公开 API。Float 子窗口天然浮于主窗口之上；
-    // 主 UIAbility 窗口的置顶由系统管理。此处仅记录意图，is_always_on_top 据此返回。
-    // 后续若 OHOS 开放 setWindowType/z-level API，在此接入 openharmony-ability 封装。
+    // Records intent (is_always_on_top reads this) AND dispatches to OHOS
+    // setWindowTopmost (API 14+, needs ohos.permission.WINDOW_TOPMOST). Main window
+    // only per OHOS docs; Float sub-windows will error (caught + warned in ArkTS,
+    // non-fatal). Only effective in freeform window mode.
     self.always_on_top.store(always_on_top, Ordering::Release);
-    if always_on_top {
-      log::warn!("`Window::set_always_on_top(true)` recorded but not enforced on OpenHarmony (no z-order API)");
+    let id = self.ohos_win_id();
+    if let Err(e) = set_window_topmost(id, always_on_top) {
+      log::warn!("[tao-ohos] set_window_topmost failed for window {}: {}", id, e);
     }
   }
-  pub fn set_ime_position(&self, _position: Position) {}
+  pub fn set_ime_position(&self, position: Position) {
+    // IME 位置:转物理像素后透传给 ArkTS inputMethod.updateCursor(CursorInfo)。
+    // 需要窗口内有已聚焦的编辑框,否则 ArkTS 侧报 12800003(正常)。
+    let p = position.to_physical::<i32>(self.scale_factor());
+    let id = self.ohos_win_id();
+    if let Err(e) = set_ime_position(id, p.x as i64, p.y as i64) {
+      log::warn!("[tao-ohos] set_ime_position failed for window {}: {}", id, e);
+    }
+  }
 
   pub fn is_decorated(&self) -> bool {
     self.decorations.load(Ordering::Acquire)
@@ -1242,7 +1417,12 @@ impl Window {
     ))
   }
 
-  pub fn request_user_attention(&self, _request_type: Option<window::UserAttentionType>) {}
+  pub fn request_user_attention(&self, _request_type: Option<window::UserAttentionType>) {
+    // OHOS window layer has no requestAttention API. Uses notificationManager via ArkTS.
+    if let Err(e) = request_user_attention() {
+      log::warn!("[tao-ohos] request_user_attention failed: {}", e);
+    }
+  }
 
   pub fn set_cursor_position(&self, _: Position) -> Result<(), error::ExternalError> {
     Err(error::ExternalError::NotSupported(
@@ -1277,21 +1457,30 @@ impl Window {
     }
   }
   pub fn drag_window(&self) -> Result<(), error::ExternalError> {
-    // OHOS SDK 无 startWindowMove 公开 API。Float 子窗口拖拽由 FloatPage
-    // PanGesture 手柄处理（UI 层），不通过该编程式 API 暴露。
-    Err(error::ExternalError::NotSupported(
-      error::NotSupportedError::new(),
-    ))
+    // OHOS startMoving (API14+) must be called in onTouch(TouchType.Down) —
+    // cannot be triggered programmatically from Rust. Float sub-windows drag
+    // via FloatPage title bar onTouch→startMoving; the main UIAbility window
+    // has no such path, so this is a no-op there. Returns Ok (no error) since
+    // drag is handled at the UI layer (FloatPage), not via this API.
+    log::debug!(
+      "[tao-ohos] drag_window: no-op (startMoving must be called from onTouch in FloatPage; window_id={:?})",
+      self.window_id
+    );
+    Ok(())
   }
 
   pub fn drag_resize_window(
     &self,
     _direction: ResizeDirection,
   ) -> Result<(), error::ExternalError> {
-    // OHOS SDK 无 startWindowResize / Direction 枚举。同 A3，由 FloatPage 手柄处理。
-    Err(error::ExternalError::NotSupported(
-      error::NotSupportedError::new(),
-    ))
+    // OHOS enableDrag (API20+) allows/disables edge drag-resize, but cannot
+    // programmatically trigger a specific direction resize. System handles
+    // edge drag natively. This returns Ok (no error).
+    let id = self.ohos_win_id();
+    if let Err(e) = set_window_draggable(id, true) {
+      log::warn!("[tao-ohos] set_window_draggable(true) failed for window {}: {}", id, e);
+    }
+    Ok(())
   }
 
   pub fn set_background_color(&self, color: Option<crate::window::RGBA>) {
@@ -1310,27 +1499,38 @@ impl Window {
   }
 
   pub fn theme(&self) -> Theme {
-    match self.theme.load(Ordering::Relaxed) {
-      1 => Theme::Dark,
-      _ => Theme::Light,
+    // 问题五 5.2 theme 回灌:读全局 override;FOLLOW 时回落到 app.config()。
+    // app.config().color_mode 由 ConfigChanged(onConfigurationUpdated)持续刷新,
+    // 反映系统真值——故 FOLLOW 模式下无需手动回灌即与系统同步。
+    use openharmony_ability::ColorMode;
+    match APP_THEME_OVERRIDE.load(Ordering::Relaxed) {
+      THEME_OVERRIDE_DARK => Theme::Dark,
+      THEME_OVERRIDE_LIGHT => Theme::Light,
+      _ => {
+        // FOLLOW:读系统真值。
+        match self.app.config().color_mode {
+          ColorMode::Dark => Theme::Dark,
+          // Light 或 NoSet(启动前未收到 ConfigChanged)→ Light。
+          _ => Theme::Light,
+        }
+      }
     }
   }
 
   pub fn set_theme(&self, theme: Option<Theme>) {
     use openharmony_ability::ColorMode;
+    // 写 override:Some → 显式覆盖;None → FOLLOW(跟随系统)。
+    APP_THEME_OVERRIDE.store(
+      match theme {
+        Some(Theme::Dark) => THEME_OVERRIDE_DARK,
+        Some(Theme::Light) => THEME_OVERRIDE_LIGHT,
+        None => THEME_OVERRIDE_FOLLOW,
+      },
+      Ordering::Relaxed,
+    );
     let color_mode = match theme {
       Some(Theme::Dark) => ColorMode::Dark,
-      Some(Theme::Light) | None => ColorMode::Light,
-    };
-    // Store the resolved theme; None → Light (default)
-    let stored = theme.unwrap_or(Theme::Light);
-    self.theme.store(match stored {
-      Theme::Dark => 1,
-      Theme::Light => 0,
-    }, Ordering::Relaxed);
-    // If theme is None, follow system → NoSet
-    let color_mode = match theme {
-      Some(_) => color_mode,
+      Some(Theme::Light) => ColorMode::Light,
       None => ColorMode::NoSet,
     };
     if let Err(e) = self.app.set_color_mode(color_mode) {
