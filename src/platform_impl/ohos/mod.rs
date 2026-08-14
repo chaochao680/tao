@@ -2,7 +2,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::{HashSet, VecDeque};
 use std::hash::Hash;
 use std::marker::PhantomData;
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering};
 use std::sync::mpsc;
 use std::ptr::NonNull;
 use std::ffi::c_void;
@@ -833,6 +833,11 @@ pub struct PlatformSpecificWindowBuilderAttributes {
 pub(crate) struct Window {
   app: OpenHarmonyApp,
   window_id: Option<i64>,
+  /// 窗口种类(UIAbility/Float)。set_inner_size 的标题栏高度补偿仅对 UIAbility
+  /// 有效——app.window_rect()/content_rect() 是共享 OpenHarmonyApp 上的单一 Rect,
+  /// 只反映主窗口;Float 子窗口无系统标题栏(FloatPage 自带 UI 标题栏),套用主窗口
+  /// 的 decor_height 会错配,故 Float 跳过补偿(G7)。
+  kind: OHOSWindowKind,
   /// Phase 2: window decoration state (title bar visibility).
   /// AtomicBool supports runtime toggle from arbitrary threads.
   decorations: AtomicBool,
@@ -861,6 +866,14 @@ pub(crate) struct Window {
   /// 装饰按钮可用性位域。bit0 closable, bit1 maximizable, bit2 minimizable,
   /// bit3 resizable。默认 0b1111=15（全可用）。
   decoration_flags: AtomicU8,
+  /// 窗口尺寸约束缓存(min/max w/h,px)。OHOS `setWindowLimits` 一次性写四值
+  /// (0=无限制),非增量;故 `set_min_inner_size`/`set_max_inner_size` 必须把两套
+  /// 约束一起下发,否则后调者会把另一维度重置为 0(丢约束)。两个 setter 各自更新
+  /// 自己的缓存位,再读对方缓存,四值同下。AtomicU32 因 setter 可从任意线程调用。
+  min_inner_width: AtomicU32,
+  min_inner_height: AtomicU32,
+  max_inner_width: AtomicU32,
+  max_inner_height: AtomicU32,
 }
 
 /// 装饰按钮位域常量（与 openharmony-ability ArkTS 一致）。
@@ -1019,19 +1032,34 @@ impl Window {
           background_color: rgba_to_ohos_color(window_attrs.transparent, window_attrs.background_color),
           ..WindowCreateParams::default()
         };
-        create_os_window(params).ok()
+        // G6: create_os_window returns Result<i64>. Previously `.ok()` swallowed the
+        // error and built a window_id=None Window, after which ohos_win_id()==0
+        // silently routed every subsequent op (topmost/title/limits/status) to the
+        // main window. Fail loud instead — mirrors the start_ui_ability failure path.
+        match create_os_window(params) {
+          Ok(id) => Some(id),
+          Err(e) => {
+            log::error!("create_os_window failed: {:?}", e);
+            return Err(os_error!(OsError));
+          }
+        }
       }
     };
 
     let win = Self {
       app: el.app.clone(),
       window_id,
+      kind,
       decorations: AtomicBool::new(window_attrs.decorations),
       transparent: window_attrs.transparent,
       visible: AtomicBool::new(true),
       fullscreen: AtomicBool::new(false),
       always_on_top: AtomicBool::new(false),
       decoration_flags: AtomicU8::new(FLAG_ALL_DECORATIONS),
+      min_inner_width: AtomicU32::new(0),
+      min_inner_height: AtomicU32::new(0),
+      max_inner_width: AtomicU32::new(0),
+      max_inner_height: AtomicU32::new(0),
     };
 
     // Apply decorations immediately for the main window at creation time.
@@ -1109,12 +1137,24 @@ impl Window {
     // decor_height = window_rect.height - content_rect.height (title bar + borders).
     // Without this, save→restore loops shrink the window by one title bar each cycle
     // (遗留问题二: inner/outer 语义错位).
-    let window = self.app.window_rect();
-    let content = self.app.content_rect();
-    let decor_height = if window.height > content.height && content.height > 0 {
-      (window.height - content.height) as u32
+    //
+    // G7: app.window_rect()/content_rect() read a single Rect on the shared
+    // OpenHarmonyApp that mirrors the MAIN UIAbility window — not this window.
+    // The compensation is therefore only valid for UIAbility windows: the system
+    // title bar height is uniform app-wide, so the main window's decor_height is a
+    // correct approximation even for subsequent UIAbilities. Float sub-windows have
+    // no system title bar (FloatPage ships its own UI title bar), so applying the
+    // main window's decor_height would shrink/grow them by the wrong inset — skip.
+    let decor_height = if self.kind == OHOSWindowKind::Float {
+      0
     } else {
-      0  // no decorations or content not yet initialized
+      let window = self.app.window_rect();
+      let content = self.app.content_rect();
+      if window.height > content.height && content.height > 0 {
+        (window.height - content.height) as u32
+      } else {
+        0  // no decorations or content not yet initialized
+      }
     };
     let outer_height = s.height.saturating_add(decor_height);
     let _ = resize_window(self.ohos_win_id(), s.width as i64, outer_height as i64);
@@ -1146,10 +1186,11 @@ impl Window {
   }
 
   pub fn set_min_inner_size(&self, size: Option<Size>) {
-    // OHOS setWindowLimits (API 11+) sets all four (min/max w/h) at once. We store
-    // only the min here; max is left as 0 (no limit). If both min and max are needed,
-    // caller should set max first then min (last call wins the max=0 reset — known
-    // simplification, acceptable for the "careful testing" scope).
+    // OHOS setWindowLimits (API 11+) writes all four (min/max w/h) at once, where
+    // 0 = no limit. It is NOT incremental — a call sets the whole tuple. So we cache
+    // the min here, read the cached max, and dispatch both constraints together.
+    // Otherwise calling set_min after set_max would reset max to 0 (dropping the max
+    // constraint), and vice versa — the two setters were mutually exclusive.
     // ⚠️ Triggers OnSizeChange — do not call frequently (appfreeze risk).
     let (min_w, min_h) = match size {
       Some(s) => {
@@ -1158,14 +1199,18 @@ impl Window {
       }
       None => (0, 0),
     };
+    self.min_inner_width.store(min_w, Ordering::Release);
+    self.min_inner_height.store(min_h, Ordering::Release);
+    let max_w = self.max_inner_width.load(Ordering::Acquire);
+    let max_h = self.max_inner_height.load(Ordering::Acquire);
     let id = self.ohos_win_id();
-    if let Err(e) = set_window_limits(id, min_w, min_h, 0, 0) {
+    if let Err(e) = set_window_limits(id, min_w, min_h, max_w, max_h) {
       log::warn!("[tao-ohos] set_window_limits (min) failed for window {}: {}", id, e);
     }
   }
 
   pub fn set_max_inner_size(&self, size: Option<Size>) {
-    // See set_min_inner_size note. Only max is set; min left as 0 (no limit).
+    // See set_min_inner_size note. Cache max, read cached min, dispatch both together.
     let (max_w, max_h) = match size {
       Some(s) => {
         let p = s.to_physical::<u32>(self.scale_factor());
@@ -1173,8 +1218,12 @@ impl Window {
       }
       None => (0, 0),
     };
+    self.max_inner_width.store(max_w, Ordering::Release);
+    self.max_inner_height.store(max_h, Ordering::Release);
+    let min_w = self.min_inner_width.load(Ordering::Acquire);
+    let min_h = self.min_inner_height.load(Ordering::Acquire);
     let id = self.ohos_win_id();
-    if let Err(e) = set_window_limits(id, 0, 0, max_w, max_h) {
+    if let Err(e) = set_window_limits(id, min_w, min_h, max_w, max_h) {
       log::warn!("[tao-ohos] set_window_limits (max) failed for window {}: {}", id, e);
     }
   }
@@ -1477,8 +1526,20 @@ impl Window {
     // programmatically trigger a specific direction resize. System handles
     // edge drag natively. This returns Ok (no error).
     let id = self.ohos_win_id();
-    if let Err(e) = set_window_draggable(id, true) {
-      log::warn!("[tao-ohos] set_window_draggable(true) failed for window {}: {}", id, e);
+    // G10: log the success path too so callers can tell "edge-drag enabled"
+    // apart from an actual directional resize — the _direction is ignored and
+    // no directional resize is started. Mirrors the drag_window no-op log above.
+    match set_window_draggable(id, true) {
+      Ok(()) => log::debug!(
+        "[tao-ohos] drag_resize_window: no directional resize API (_direction ignored); \
+         enableDrag(true) set for window {}",
+        id
+      ),
+      Err(e) => log::warn!(
+        "[tao-ohos] set_window_draggable(true) failed for window {}: {}",
+        id,
+        e
+      ),
     }
     Ok(())
   }
