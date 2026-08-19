@@ -21,6 +21,7 @@ use openharmony_ability::window::{
   set_window_title, set_window_limits, request_redraw, request_user_attention,
   set_ime_position, set_window_draggable,
   set_pointer_visible, set_pointer_style,
+  set_cursor_grab, CursorGrabError,
   start_ui_ability, next_window_id,
 };
 
@@ -1460,10 +1461,30 @@ impl Window {
       log::warn!("set_cursor_icon failed to dispatch: {:?}", e);
     }
   }
-  pub fn set_cursor_grab(&self, _: bool) -> Result<(), error::ExternalError> {
-    Err(error::ExternalError::NotSupported(
-      error::NotSupportedError::new(),
-    ))
+  pub fn set_cursor_grab(&self, grab: bool) -> Result<(), error::ExternalError> {
+    // OH_WindowManager_LockCursor/UnlockCursor (NDK C API 22+, resolved via
+    // dlopen in openharmony-ability). Lock is confined-follow mode — cursor
+    // keeps moving within the window area, matching Windows ClipCursor
+    // semantics. Only effective while the window is focused; the system
+    // releases the lock automatically on focus loss (platform difference vs
+    // Windows — apps that need a persistent lock re-grab on Focused(true)).
+    match set_cursor_grab(self.ohos_win_id(), grab) {
+      Ok(()) => Ok(()),
+      // Unsupported device (API < 22 / 801): same error as before this was
+      // implemented, so callers see identical behavior on old devices.
+      Err(CursorGrabError::NotSupported) => Err(error::ExternalError::NotSupported(
+        error::NotSupportedError::new(),
+      )),
+      Err(e) => {
+        log::warn!(
+          "[tao-ohos] set_cursor_grab({}) failed for window {}: {}",
+          grab,
+          self.ohos_win_id(),
+          e
+        );
+        Err(error::ExternalError::Os(os_error!(OsError)))
+      }
+    }
   }
 
   pub fn request_user_attention(&self, _request_type: Option<window::UserAttentionType>) {
