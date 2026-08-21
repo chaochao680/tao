@@ -18,7 +18,7 @@ use openharmony_ability::window::{
   is_window_maximized, is_window_minimized,
   set_fullscreen as ohos_set_fullscreen, set_window_touchable,
   set_window_decoration_flags, set_window_focusable, set_window_topmost,
-  set_window_title, set_window_limits, request_redraw, request_user_attention,
+  set_window_title, set_window_limits, request_user_attention,
   set_ime_position, set_window_draggable,
   set_pointer_visible, set_pointer_style,
   set_cursor_grab, CursorGrabError,
@@ -657,12 +657,6 @@ impl<T: 'static> EventLoop<T> {
             }
           }
         }
-        MainEvent::FoldDisplayModeChange(mode) => {
-          // Foldable screen fold/unfold event. System will fire windowSizeChange/
-          // ContentRectChange after display size changes, which propagates as Resized.
-          // Just log; actual resize handled by ContentRectChange.
-          log::info!("[tao-ohos] FoldDisplayModeChange: mode={}", mode);
-        }
         unknown => {
           trace!("Unknown MainEvent {unknown:?} (ignored)");
         }
@@ -1075,11 +1069,8 @@ impl Window {
   }
 
   pub fn request_redraw(&self) {
-    // OHOS vsync auto-drives rendering; this calls ArkTS for log/debug.
-    let id = self.ohos_win_id();
-    if let Err(e) = request_redraw(id) {
-      log::warn!("[tao-ohos] request_redraw failed for window {}: {}", id, e);
-    }
+    // OHOS vsync auto-drives rendering; there is no app-initiated redraw API,
+    // so this is a no-op (the former ArkTS bridge was removed upstream).
   }
 
   #[inline]
@@ -1112,10 +1103,28 @@ impl Window {
     let content = self.app.content_rect();
     let window = self.app.window_rect();
     // inner_position = content area position on screen
-    // = window position + content offset relative to window
-    // content_rect.left/top is XComponent offset relative to its parent container
-    // In OHOS: Screen -> Window -> Container -> XComponent
-    Ok(PhysicalPosition::new(window.left + content.left, window.top + content.top))
+    // = window position + system title-bar offset + content offset within container.
+    // content_rect.left/top is XComponent offset relative to its parent container,
+    // which already sits BELOW the system title bar — the title bar height is not
+    // included. Add decor_height (window_rect − content_rect), mirroring
+    // set_inner_size's compensation (遗留问题二 getter 侧): without this,
+    // innerPosition == outerPosition on decorated windows (observed 2026-08-20:
+    // inner (515,451) == outer (515,451) with a 146px title bar; true content
+    // origin is (515,597)).
+    // Float sub-windows have no system title bar (FloatPage ships its own UI bar):
+    // skip, same as set_inner_size. (G7: the mirrored rects track the MAIN window,
+    // so this getter is only meaningful for main/UIAbility windows regardless.)
+    let decor_height = if self.kind == OHOSWindowKind::Float {
+      0
+    } else if window.height > content.height && content.height > 0 {
+      window.height - content.height
+    } else {
+      0 // no decorations or content not yet initialized
+    };
+    Ok(PhysicalPosition::new(
+      window.left + content.left,
+      window.top + content.top + decor_height,
+    ))
   }
 
   pub fn inner_size(&self) -> PhysicalSize<u32> {
@@ -1417,8 +1426,9 @@ impl Window {
     }
   }
   pub fn set_ime_position(&self, position: Position) {
-    // IME 位置:转物理像素后透传给 ArkTS inputMethod.updateCursor(CursorInfo)。
-    // 需要窗口内有已聚焦的编辑框,否则 ArkTS 侧报 12800003(正常)。
+    // IME 位置:转物理像素后透传给 ArkTS inputMethod.getController().updateCursor(CursorInfo)。
+    // 前置:窗口内有已聚焦的编辑框(HTML input 亦可),否则报 12800009 client detached(正常)。
+    // 聚焦 HTML input 后实测 OK(2026-08-19)— webview 场景可用,非架构限制。
     let p = position.to_physical::<i32>(self.scale_factor());
     let id = self.ohos_win_id();
     if let Err(e) = set_ime_position(id, p.x as i64, p.y as i64) {
