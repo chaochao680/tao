@@ -111,6 +111,11 @@ tao-macros = { version = "0.1.0", path = "./tao-macros" }
 [target."cfg(target_env = \"ohos\")".dependencies]
 openharmony-ability = { path = "../openharmony-ability/crates/ability" }
 openharmony-ability-derive = { path = "../openharmony-ability/crates/derive" }
+openharmony-ability-plugin-window = { path = "../openharmony-ability/crates/plugin-window" }
+openharmony-ability-plugin-app-control = { path = "../openharmony-ability/crates/plugin-app-control" }
+# tao is a standalone workspace (members = ["tao-macros"], no [workspace.dependencies]).
+# Cannot use workspace = true; pin directly to match openharmony-ability's tokio version.
+tokio = { version = "1", features = ["rt", "sync"] }
 
 [target."cfg(any(target_os = \"ios\", target_os = \"macos\"))".dependencies]
 objc2 = "0.6"

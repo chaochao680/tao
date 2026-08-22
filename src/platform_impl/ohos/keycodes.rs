@@ -375,3 +375,359 @@ pub fn to_location(keycode: Keycode) -> KeyLocation {
     _ => KeyLocation::Standard,
   }
 }
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+  use openharmony_ability::xcomponent::KeyCode::*;
+
+  // ─── to_logical: navigation & media ────────────────────────────────────
+
+  #[test]
+  fn to_logical_home_maps_to_browser_home() {
+    assert!(matches!(to_logical(Home), Key::BrowserHome));
+  }
+
+  #[test]
+  fn to_logical_back_maps_to_browser_back() {
+    assert!(matches!(to_logical(Back), Key::BrowserBack));
+  }
+
+  #[test]
+  fn to_logical_dpad_navigation() {
+    assert!(matches!(to_logical(DpadUp), Key::ArrowUp));
+    assert!(matches!(to_logical(DpadDown), Key::ArrowDown));
+    assert!(matches!(to_logical(DpadLeft), Key::ArrowLeft));
+    assert!(matches!(to_logical(DpadRight), Key::ArrowRight));
+    assert!(matches!(to_logical(DpadCenter), Key::Enter));
+  }
+
+  #[test]
+  fn to_logical_volume_keys() {
+    assert!(matches!(to_logical(VolumeUp), Key::AudioVolumeUp));
+    assert!(matches!(to_logical(VolumeDown), Key::AudioVolumeDown));
+    assert!(matches!(to_logical(VolumeMute), Key::AudioVolumeMute));
+  }
+
+  #[test]
+  fn to_logical_media_keys() {
+    assert!(matches!(to_logical(MediaPlayPause), Key::MediaPlayPause));
+    assert!(matches!(to_logical(MediaStop), Key::MediaStop));
+    assert!(matches!(to_logical(MediaNext), Key::MediaTrackNext));
+    assert!(matches!(to_logical(MediaPrevious), Key::MediaTrackPrevious));
+    assert!(matches!(to_logical(MediaRewind), Key::MediaRewind));
+    assert!(matches!(to_logical(MediaFastForward), Key::MediaFastForward));
+    assert!(matches!(to_logical(MediaPlay), Key::MediaPlay));
+    assert!(matches!(to_logical(MediaPause), Key::MediaPause));
+    assert!(matches!(to_logical(MediaClose), Key::MediaClose));
+    assert!(matches!(to_logical(MediaEject), Key::Eject));
+    assert!(matches!(to_logical(MediaRecord), Key::MediaRecord));
+  }
+
+  #[test]
+  fn to_logical_mute_maps_to_microphone_volume_mute() {
+    assert!(matches!(to_logical(Mute), Key::MicrophoneVolumeMute));
+  }
+
+  // ─── to_logical: modifier keys ────────────────────────────────────────
+
+  #[test]
+  fn to_logical_alt_keys() {
+    assert!(matches!(to_logical(AltLeft), Key::Alt));
+    assert!(matches!(to_logical(AltRight), Key::Alt));
+  }
+
+  #[test]
+  fn to_logical_shift_keys() {
+    assert!(matches!(to_logical(ShiftLeft), Key::Shift));
+    assert!(matches!(to_logical(ShiftRight), Key::Shift));
+  }
+
+  #[test]
+  fn to_logical_ctrl_keys() {
+    assert!(matches!(to_logical(CtrlLeft), Key::Control));
+    assert!(matches!(to_logical(CtrlRight), Key::Control));
+  }
+
+  #[test]
+  fn to_logical_meta_keys() {
+    assert!(matches!(to_logical(MetaLeft), Key::Super));
+    assert!(matches!(to_logical(MetaRight), Key::Super));
+  }
+
+  #[test]
+  fn to_logical_caps_scroll_num_lock() {
+    assert!(matches!(to_logical(CapsLock), Key::CapsLock));
+    assert!(matches!(to_logical(ScrollLock), Key::ScrollLock));
+    assert!(matches!(to_logical(NumLock), Key::NumLock));
+  }
+
+  // ─── to_logical: common keys ──────────────────────────────────────────
+
+  #[test]
+  fn to_logical_tab_space_enter() {
+    assert!(matches!(to_logical(Tab), Key::Tab));
+    assert!(matches!(to_logical(Space), Key::Space));
+    assert!(matches!(to_logical(Enter), Key::Enter));
+  }
+
+  #[test]
+  fn to_logical_del_maps_to_backspace() {
+    assert!(matches!(to_logical(Del), Key::Backspace));
+  }
+
+  #[test]
+  fn to_logical_forward_del_maps_to_delete() {
+    assert!(matches!(to_logical(ForwardDel), Key::Delete));
+  }
+
+  #[test]
+  fn to_logical_escape() {
+    assert!(matches!(to_logical(Escape), Key::Escape));
+  }
+
+  #[test]
+  fn to_logical_function_key() {
+    assert!(matches!(to_logical(Function), Key::Fn));
+  }
+
+  // ─── to_logical: F-keys ───────────────────────────────────────────────
+
+  #[test]
+  fn to_logical_f1_through_f12() {
+    assert!(matches!(to_logical(F1), Key::F1));
+    assert!(matches!(to_logical(F2), Key::F2));
+    assert!(matches!(to_logical(F3), Key::F3));
+    assert!(matches!(to_logical(F4), Key::F4));
+    assert!(matches!(to_logical(F5), Key::F5));
+    assert!(matches!(to_logical(F6), Key::F6));
+    assert!(matches!(to_logical(F7), Key::F7));
+    assert!(matches!(to_logical(F8), Key::F8));
+    assert!(matches!(to_logical(F9), Key::F9));
+    assert!(matches!(to_logical(F10), Key::F10));
+    assert!(matches!(to_logical(F11), Key::F11));
+    assert!(matches!(to_logical(F12), Key::F12));
+  }
+
+  // ─── to_logical: page nav & editing ───────────────────────────────────
+
+  #[test]
+  fn to_logical_page_up_down() {
+    assert!(matches!(to_logical(PageUp), Key::PageUp));
+    assert!(matches!(to_logical(PageDown), Key::PageDown));
+  }
+
+  #[test]
+  fn to_logical_move_home_end_insert() {
+    assert!(matches!(to_logical(MoveHome), Key::Home));
+    assert!(matches!(to_logical(MoveEnd), Key::End));
+    assert!(matches!(to_logical(Insert), Key::Insert));
+  }
+
+  #[test]
+  fn to_logical_forward_maps_to_browser_forward() {
+    assert!(matches!(to_logical(Forward), Key::BrowserForward));
+  }
+
+  #[test]
+  fn to_logical_sysrq_break() {
+    assert!(matches!(to_logical(SysRq), Key::PrintScreen));
+    assert!(matches!(to_logical(Break), Key::Pause));
+  }
+
+  // ─── to_logical: special buttons ──────────────────────────────────────
+
+  #[test]
+  fn to_logical_power_camera() {
+    assert!(matches!(to_logical(Power), Key::Power));
+    assert!(matches!(to_logical(Camera), Key::Camera));
+  }
+
+  #[test]
+  fn to_logical_explorer_envelope() {
+    assert!(matches!(to_logical(Explorer), Key::LaunchWebBrowser));
+    assert!(matches!(to_logical(Envelope), Key::LaunchMail));
+  }
+
+  #[test]
+  fn to_logical_sym_maps_to_symbol() {
+    assert!(matches!(to_logical(Sym), Key::Symbol));
+  }
+
+  // ─── to_logical: clipboard & refresh ──────────────────────────────────
+
+  #[test]
+  fn to_logical_cut_copy_paste() {
+    assert!(matches!(to_logical(Cut), Key::Cut));
+    assert!(matches!(to_logical(Copy), Key::Copy));
+    assert!(matches!(to_logical(Paste), Key::Paste));
+  }
+
+  #[test]
+  fn to_logical_refresh_maps_to_browser_refresh() {
+    assert!(matches!(to_logical(Refresh), Key::BrowserRefresh));
+  }
+
+  // ─── to_logical: TV & brightness ─────────────────────────────────────
+
+  #[test]
+  fn to_logical_tv_keys() {
+    assert!(matches!(to_logical(TV), Key::TV));
+    assert!(matches!(to_logical(ChannelUp), Key::ChannelUp));
+    assert!(matches!(to_logical(ChannelDown), Key::ChannelDown));
+  }
+
+  #[test]
+  fn to_logical_zoom_keys() {
+    assert!(matches!(to_logical(ZoomIn), Key::ZoomIn));
+    assert!(matches!(to_logical(ZoomOut), Key::ZoomOut));
+  }
+
+  #[test]
+  fn to_logical_brightness_keys() {
+    assert!(matches!(to_logical(BrightnessDown), Key::BrightnessDown));
+    assert!(matches!(to_logical(BrightnessUp), Key::BrightnessUp));
+  }
+
+  #[test]
+  fn to_logical_info() {
+    assert!(matches!(to_logical(Info), Key::Info));
+  }
+
+  // ─── to_logical: Japanese keys ───────────────────────────────────────
+
+  #[test]
+  fn to_logical_japanese_keys() {
+    assert!(matches!(to_logical(ZenkakuHankaku), Key::ZenkakuHankaku));
+    assert!(matches!(to_logical(Muhenkan), Key::NonConvert));
+    assert!(matches!(to_logical(Henkan), Key::Convert));
+    assert!(matches!(to_logical(KatakanaHiragana), Key::HiraganaKatakana));
+  }
+
+  // ─── to_logical: calendar & sleep ────────────────────────────────────
+
+  #[test]
+  fn to_logical_calendar_maps_to_launch_calendar() {
+    assert!(matches!(to_logical(Calendar), Key::LaunchCalendar));
+  }
+
+  #[test]
+  fn to_logical_sleep_wakeup() {
+    assert!(matches!(to_logical(Sleep), Key::Standby));
+    assert!(matches!(to_logical(Wakeup), Key::WakeUp));
+  }
+
+  #[test]
+  fn to_logical_help() {
+    assert!(matches!(to_logical(Help), Key::Help));
+  }
+
+  // ─── to_logical: unidentified fallbacks ────────────────────────────────
+
+  #[test]
+  fn to_logical_unknown_maps_to_unidentified() {
+    let result = to_logical(Unknown);
+    assert!(matches!(result, Key::Unidentified(_)));
+  }
+
+  #[test]
+  fn to_logical_numpad_keys_are_unidentified() {
+    // Numpad digits and operators map to Unidentified (no web numpad mapping)
+    for kc in [
+      Numpad0, Numpad1, Numpad2, Numpad3, Numpad4,
+      Numpad5, Numpad6, Numpad7, Numpad8, Numpad9,
+    ] {
+      assert!(matches!(to_logical(kc), Key::Unidentified(_)), "numpad digit should be Unidentified");
+    }
+    assert!(matches!(to_logical(NumpadDivide), Key::Unidentified(_)));
+    assert!(matches!(to_logical(NumpadMultiply), Key::Unidentified(_)));
+    assert!(matches!(to_logical(NumpadSubtract), Key::Unidentified(_)));
+    assert!(matches!(to_logical(NumpadAdd), Key::Unidentified(_)));
+    assert!(matches!(to_logical(NumpadDot), Key::Unidentified(_)));
+    assert!(matches!(to_logical(NumpadComma), Key::Unidentified(_)));
+    assert!(matches!(to_logical(NumpadEnter), Key::Unidentified(_)));
+    assert!(matches!(to_logical(NumpadEquals), Key::Unidentified(_)));
+    assert!(matches!(to_logical(NumpadLeftParen), Key::Unidentified(_)));
+    assert!(matches!(to_logical(NumpadRightParen), Key::Unidentified(_)));
+  }
+
+  #[test]
+  fn to_logical_alpha_keys_are_unidentified_fallback() {
+    // A-Z and 0-9 keys are matched as Unidentified (they should be resolved
+    // via KeyMapChar::Unicode first, but this is a fallback)
+    assert!(matches!(to_logical(A), Key::Unidentified(_)));
+    assert!(matches!(to_logical(Z), Key::Unidentified(_)));
+    assert!(matches!(to_logical(Key0), Key::Unidentified(_)));
+    assert!(matches!(to_logical(Key9), Key::Unidentified(_)));
+  }
+
+  #[test]
+  fn to_logical_punctuation_keys_are_unidentified_fallback() {
+    assert!(matches!(to_logical(Comma), Key::Unidentified(_)));
+    assert!(matches!(to_logical(Period), Key::Unidentified(_)));
+    assert!(matches!(to_logical(Grave), Key::Unidentified(_)));
+    assert!(matches!(to_logical(Minus), Key::Unidentified(_)));
+    assert!(matches!(to_logical(Equals), Key::Unidentified(_)));
+    assert!(matches!(to_logical(LeftBracket), Key::Unidentified(_)));
+    assert!(matches!(to_logical(RightBracket), Key::Unidentified(_)));
+    assert!(matches!(to_logical(Backslash), Key::Unidentified(_)));
+    assert!(matches!(to_logical(Semicolon), Key::Unidentified(_)));
+    assert!(matches!(to_logical(Apostrophe), Key::Unidentified(_)));
+    assert!(matches!(to_logical(Slash), Key::Unidentified(_)));
+    assert!(matches!(to_logical(At), Key::Unidentified(_)));
+    assert!(matches!(to_logical(Plus), Key::Unidentified(_)));
+  }
+
+  #[test]
+  fn to_logical_yen_ro_are_unidentified() {
+    assert!(matches!(to_logical(Yen), Key::Unidentified(_)));
+    assert!(matches!(to_logical(Ro), Key::Unidentified(_)));
+  }
+
+  #[test]
+  fn to_logical_menu_is_unidentified() {
+    assert!(matches!(to_logical(Menu), Key::Unidentified(_)));
+  }
+
+  // ─── to_location: modifier location ───────────────────────────────────
+
+  #[test]
+  fn to_location_left_modifiers() {
+    assert_eq!(to_location(AltLeft), KeyLocation::Left);
+    assert_eq!(to_location(ShiftLeft), KeyLocation::Left);
+    assert_eq!(to_location(CtrlLeft), KeyLocation::Left);
+    assert_eq!(to_location(MetaLeft), KeyLocation::Left);
+  }
+
+  #[test]
+  fn to_location_right_modifiers() {
+    assert_eq!(to_location(AltRight), KeyLocation::Right);
+    assert_eq!(to_location(ShiftRight), KeyLocation::Right);
+    assert_eq!(to_location(CtrlRight), KeyLocation::Right);
+    assert_eq!(to_location(MetaRight), KeyLocation::Right);
+  }
+
+  #[test]
+  fn to_location_numpad_keys() {
+    for kc in [
+      NumLock, Numpad0, Numpad1, Numpad2, Numpad3, Numpad4,
+      Numpad5, Numpad6, Numpad7, Numpad8, Numpad9,
+      NumpadDivide, NumpadMultiply, NumpadSubtract, NumpadAdd,
+      NumpadDot, NumpadComma, NumpadEnter, NumpadEquals,
+      NumpadLeftParen, NumpadRightParen,
+    ] {
+      assert_eq!(to_location(kc), KeyLocation::Numpad, "numpad key should be Numpad location");
+    }
+  }
+
+  #[test]
+  fn to_location_non_modifier_non_numpad_is_standard() {
+    // Regular keys (letters, digits, F-keys, arrows, etc.) are Standard
+    for kc in [
+      A, B, Key0, Key9, F1, F12, DpadUp, DpadDown,
+      Space, Tab, Enter, Escape, VolumeUp, Home, PageUp,
+    ] {
+      assert_eq!(to_location(kc), KeyLocation::Standard, "regular key should be Standard location");
+    }
+  }
+}
