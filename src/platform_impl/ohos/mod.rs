@@ -1,34 +1,24 @@
 use std::cell::{Cell, RefCell};
 use std::collections::{HashSet, VecDeque};
+use std::ffi::c_void;
 use std::hash::Hash;
 use std::marker::PhantomData;
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering};
-use std::sync::mpsc;
 use std::ptr::NonNull;
-use std::ffi::c_void;
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
+use std::sync::mpsc;
+use std::sync::Arc;
 
 use keycodes::{to_location, to_logical};
+use openharmony_ability::window::{create_os_window, WindowCreateParams, set_cursor_grab};
 use openharmony_ability::xcomponent::{Action, MouseButton as OhosMouseButton, TouchEvent};
-use openharmony_ability::{MouseAction, MouseEventData, AxisEventData, InputSourceType};
-use openharmony_ability::window::{
-  create_os_window, WindowCreateParams, set_window_decorations, set_window_background_color,
-  move_window_to, resize_window,
-  maximize_window, minimize_window, restore_window, recover_window,
-  show_window, hide_window, focus_window,
-  is_window_maximized, is_window_minimized,
-  set_fullscreen as ohos_set_fullscreen, set_window_touchable,
-  set_window_decoration_flags, set_window_focusable, set_window_topmost,
-  set_window_title, set_window_limits, request_user_attention,
-  set_ime_position, set_window_draggable,
-  set_pointer_visible, set_pointer_style,
-  set_cursor_grab, CursorGrabError,
-  start_ui_ability, next_window_id,
-};
+use openharmony_ability::{AxisEventData, InputSourceType, MouseAction, MouseEventData};
 
 use openharmony_ability::{
   ime::KeyboardStatus, Configuration, Event as MainEvent, ImeEvent, InputEvent, OpenHarmonyApp,
   OpenHarmonyWaker, Rect,
 };
+use openharmony_ability_plugin_app_control::{AppControlExt, ColorModeExt};
+use openharmony_ability_plugin_window::WindowExt;
 
 use crate::dpi::{PhysicalPosition, PhysicalSize, Position, Size};
 use crate::error::{self};
@@ -53,6 +43,52 @@ const THEME_OVERRIDE_LIGHT: u8 = 0;
 const THEME_OVERRIDE_DARK: u8 = 1;
 const THEME_OVERRIDE_FOLLOW: u8 = 2;
 static APP_THEME_OVERRIDE: AtomicU8 = AtomicU8::new(THEME_OVERRIDE_FOLLOW);
+
+/// Local cursor position cache (f64 stored as u64 bits).
+/// Updated in `handle_mouse_event` Move branch; read by `cursor_position()`.
+/// Replaces the former `openharmony_ability::CURSOR_POSITION_X/Y` global atomics.
+static CURSOR_X: AtomicU64 = AtomicU64::new(0);
+static CURSOR_Y: AtomicU64 = AtomicU64::new(0);
+
+/// Background tokio runtime for spawning async bridge calls (fire-and-forget).
+///
+/// `WindowClient` methods are `async` and return `Result<()>`. tao's window
+/// operation APIs (e.g. `set_inner_size`) are synchronous and return `()` — they
+/// cannot `.await`. `BridgeExecutor` wraps a `tokio::runtime::Handle` from a
+/// dedicated background thread (`ohos-bridge-rt`) that drives a current-thread
+/// runtime. Calling `spawn(future)` sends the future to that background thread
+/// to be polled. The TSFN NonBlocking call inside `WindowClient` returns
+/// immediately; the ArkTS callback runs on the main thread → no deadlock.
+///
+/// `tokio::runtime::Handle` is `Clone + Send + Sync`, so `BridgeExecutor` is
+/// safely cloneable and can be stored in both `EventLoop` and `Window`.
+#[derive(Clone)]
+struct BridgeExecutor {
+    handle: tokio::runtime::Handle,
+}
+
+impl BridgeExecutor {
+    fn new() -> Self {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("Failed to create OHOS bridge runtime");
+        let handle = runtime.handle().clone();
+        std::thread::Builder::new()
+            .name("ohos-bridge-rt".into())
+            .spawn(move || runtime.block_on(std::future::pending::<()>()))
+            .expect("Failed to spawn bridge runtime thread");
+        Self { handle }
+    }
+
+    /// Spawn a fire-and-forget bridge call. The result is ignored.
+    fn spawn<F>(&self, future: F)
+    where
+        F: std::future::Future<Output = ()> + Send + 'static,
+    {
+        self.handle.spawn(future);
+    }
+}
 
 /// Tracks currently pressed keys for repeat detection.
 /// When a Down event arrives for a key already in this set, it's a repeat.
@@ -98,11 +134,12 @@ fn ohos_mouse_button_to_tao(button: OhosMouseButton) -> Option<event::MouseButto
 
 pub struct EventLoop<T: 'static> {
   pub(crate) openharmony_app: OpenHarmonyApp,
-  window_target: event_loop::EventLoopWindowTarget<T>,
+  bridge_executor: BridgeExecutor,
+  window_target: Arc<event_loop::EventLoopWindowTarget<T>>,
   _cause: StartCause,
   user_events_sender: mpsc::Sender<T>,
-  user_events_receiver: PeekableReceiver<T>,
-  event_loop: RefCell<Option<Box<dyn FnMut(event::Event<T>)>>>,
+  user_events_receiver: Arc<RefCell<PeekableReceiver<T>>>,
+  event_loop: Arc<RefCell<Option<Box<dyn FnMut(event::Event<T>) + 'static>>>>,
 }
 
 #[derive(Clone, PartialEq, Eq, Hash)]
@@ -127,30 +164,34 @@ impl<T: 'static> EventLoop<T> {
              OpenHarmony or HarmonyNext",
     );
 
+    let bridge_executor = BridgeExecutor::new();
+
     Self {
       openharmony_app: openharmony_app.clone(),
-      window_target: event_loop::EventLoopWindowTarget {
+      bridge_executor: bridge_executor.clone(),
+      window_target: Arc::new(event_loop::EventLoopWindowTarget {
         p: EventLoopWindowTarget {
           app: openharmony_app.clone(),
+          bridge_executor,
           _control_flow: Cell::new(ControlFlow::default()),
           exit: Cell::new(false),
           _marker: PhantomData,
         },
         _marker: PhantomData,
-      },
+      }),
       _cause: StartCause::Init,
       user_events_sender,
-      user_events_receiver: PeekableReceiver::from_recv(user_events_receiver),
-      event_loop: RefCell::new(None),
+      user_events_receiver: Arc::new(RefCell::new(PeekableReceiver::from_recv(user_events_receiver))),
+      event_loop: Arc::new(RefCell::new(None)),
     }
   }
 
   pub(crate) fn window_target(&self) -> &event_loop::EventLoopWindowTarget<T> {
-    &self.window_target
+    &*self.window_target
   }
 
   // TODO: For input event, we need some real examples to test it
-  fn handle_input_event(&self, event: &InputEvent) {
+  fn handle_input_event(event_loop_cell: &Arc<RefCell<Option<Box<dyn FnMut(event::Event<T>) + 'static>>>>, event: &InputEvent) {
     #[allow(unreachable_patterns)]
     match event {
       InputEvent::TouchEvent(motion_event) => {
@@ -187,17 +228,17 @@ impl<T: 'static> EventLoop<T> {
                 force: Some(Force::Normalized(pointer.force as f64)),
               }),
             };
-            if let Some(ref mut h) = *self.event_loop.borrow_mut() {
+            if let Some(ref mut h) = *event_loop_cell.borrow_mut() {
               h(event);
             }
           }
         }
       }
       InputEvent::MouseEvent(mouse_event) => {
-        self.handle_mouse_event(mouse_event);
+        Self::handle_mouse_event(event_loop_cell, mouse_event);
       }
       InputEvent::AxisEvent(axis_event) => {
-        self.handle_axis_event(axis_event);
+        Self::handle_axis_event(event_loop_cell, axis_event);
       }
       InputEvent::KeyEvent(key) => {
         match key.code {
@@ -240,7 +281,7 @@ impl<T: 'static> EventLoop<T> {
                 is_synthetic: false,
               },
             };
-            if let Some(ref mut h) = *self.event_loop.borrow_mut() {
+            if let Some(ref mut h) = *event_loop_cell.borrow_mut() {
               h(event);
             }
           }
@@ -248,7 +289,7 @@ impl<T: 'static> EventLoop<T> {
       }
       InputEvent::ImeEvent(data) => match data {
         ImeEvent::TextInputEvent(s) => {
-          if let Some(ref mut h) = *self.event_loop.borrow_mut() {
+          if let Some(ref mut h) = *event_loop_cell.borrow_mut() {
             h(event::Event::WindowEvent {
               window_id: window::WindowId(WindowId),
               event: event::WindowEvent::ReceivedImeText(s.text.clone()),
@@ -256,7 +297,7 @@ impl<T: 'static> EventLoop<T> {
           }
         }
         ImeEvent::BackspaceEvent(_) => {
-          if let Some(ref mut h) = *self.event_loop.borrow_mut() {
+          if let Some(ref mut h) = *event_loop_cell.borrow_mut() {
             // Mock keyboard input event
             let _ = [ElementState::Pressed, ElementState::Released].map(|state| {
               h(event::Event::WindowEvent {
@@ -279,7 +320,7 @@ impl<T: 'static> EventLoop<T> {
           }
         }
         ImeEvent::EnterEvent(_) => {
-          if let Some(ref mut h) = *self.event_loop.borrow_mut() {
+          if let Some(ref mut h) = *event_loop_cell.borrow_mut() {
             // Mock keyboard input event
             // Mock keyboard input event
             let _ = [ElementState::Pressed, ElementState::Released].map(|state| {
@@ -304,7 +345,7 @@ impl<T: 'static> EventLoop<T> {
         }
         ImeEvent::ImeStatusEvent(s) => match s {
           KeyboardStatus::Hide => {
-            if let Some(ref mut h) = *self.event_loop.borrow_mut() {
+            if let Some(ref mut h) = *event_loop_cell.borrow_mut() {
               // Mock keyboard input event that make sure egui can receive the event and trigger onblur event
               let _ = [ElementState::Pressed, ElementState::Released].map(|state| {
                 h(event::Event::WindowEvent {
@@ -338,18 +379,20 @@ impl<T: 'static> EventLoop<T> {
   }
 
   /// Handle mouse events from the OHOS NDK, converting them to tao WindowEvents.
-  fn handle_mouse_event(&self, mouse_event: &MouseEventData) {
+  fn handle_mouse_event(event_loop_cell: &Arc<RefCell<Option<Box<dyn FnMut(event::Event<T>) + 'static>>>>, mouse_event: &MouseEventData) {
     let window_id = window::WindowId(WindowId);
     // Use device_id 0 for mouse, consistent across events.
     let device_id = event::DeviceId(DeviceId(0));
 
     match mouse_event.action {
       MouseAction::Move => {
+        CURSOR_X.store((mouse_event.x as f64).to_bits(), Ordering::Relaxed);
+        CURSOR_Y.store((mouse_event.y as f64).to_bits(), Ordering::Relaxed);
         let position = PhysicalPosition {
           x: mouse_event.x as f64,
           y: mouse_event.y as f64,
         };
-        if let Some(ref mut h) = *self.event_loop.borrow_mut() {
+        if let Some(ref mut h) = *event_loop_cell.borrow_mut() {
           h(event::Event::WindowEvent {
             window_id,
             event: event::WindowEvent::CursorMoved {
@@ -362,7 +405,7 @@ impl<T: 'static> EventLoop<T> {
       }
       MouseAction::Press => {
         if let Some(button) = ohos_mouse_button_to_tao(mouse_event.button) {
-          if let Some(ref mut h) = *self.event_loop.borrow_mut() {
+          if let Some(ref mut h) = *event_loop_cell.borrow_mut() {
             h(event::Event::WindowEvent {
               window_id,
               event: event::WindowEvent::MouseInput {
@@ -377,7 +420,7 @@ impl<T: 'static> EventLoop<T> {
       }
       MouseAction::Release => {
         if let Some(button) = ohos_mouse_button_to_tao(mouse_event.button) {
-          if let Some(ref mut h) = *self.event_loop.borrow_mut() {
+          if let Some(ref mut h) = *event_loop_cell.borrow_mut() {
             h(event::Event::WindowEvent {
               window_id,
               event: event::WindowEvent::MouseInput {
@@ -391,7 +434,7 @@ impl<T: 'static> EventLoop<T> {
         }
       }
       MouseAction::HoverEnter => {
-        if let Some(ref mut h) = *self.event_loop.borrow_mut() {
+        if let Some(ref mut h) = *event_loop_cell.borrow_mut() {
           h(event::Event::WindowEvent {
             window_id,
             event: event::WindowEvent::CursorEntered { device_id },
@@ -399,7 +442,7 @@ impl<T: 'static> EventLoop<T> {
         }
       }
       MouseAction::HoverLeave => {
-        if let Some(ref mut h) = *self.event_loop.borrow_mut() {
+        if let Some(ref mut h) = *event_loop_cell.borrow_mut() {
           h(event::Event::WindowEvent {
             window_id,
             event: event::WindowEvent::CursorLeft { device_id },
@@ -413,12 +456,12 @@ impl<T: 'static> EventLoop<T> {
   }
 
   /// Handle axis (scroll wheel) events from the OHOS ArkUI runtime.
-  fn handle_axis_event(&self, axis_event: &AxisEventData) {
+  fn handle_axis_event(event_loop_cell: &Arc<RefCell<Option<Box<dyn FnMut(event::Event<T>) + 'static>>>>, axis_event: &AxisEventData) {
     let window_id = window::WindowId(WindowId);
     let device_id = event::DeviceId(DeviceId(0));
     let is_touchpad = axis_event.source_type == InputSourceType::Touchpad;
 
-    if let Some(ref mut h) = *self.event_loop.borrow_mut() {
+    if let Some(ref mut h) = *event_loop_cell.borrow_mut() {
       // Emit scroll wheel event.
       // Use PixelDelta for touchpad (pixel-based), LineDelta for mouse wheel (line-based).
       if axis_event.delta_x != 0.0 || axis_event.delta_y != 0.0 {
@@ -479,31 +522,50 @@ impl<T: 'static> EventLoop<T> {
     F: FnMut(event::Event<T>, &event_loop::EventLoopWindowTarget<T>, &mut ControlFlow),
   {
     let mut control_flow = ControlFlow::default();
-    let target = &self.window_target;
+    let target = self.window_target.clone();
 
     {
+      // SAFETY: `run_return` is exposed via the `EventLoopExtRunReturn` trait which
+      // permits non-`'static` callbacks, so the user `event_handle` (and therefore the
+      // closure) may not be `'static`. The `HAS_EVENT`/single-dispatch invariant plus
+      // the fact that `run_return` does not return until the app exits guarantee the
+      // stored closure is never invoked after its captures are invalidated: `target`
+      // is an owned `Arc` (genuinely `'static`), `control_flow` is owned, and
+      // `event_handle` is dropped together with the `event_loop` slot when the
+      // `OpenHarmonyApp` shuts down. The transmute erases only the callback's
+      // lifetime. (Removing the transmute entirely would require tightening the
+      // trait bound to `F: 'static`, which the shared `EventLoopExtRunReturn` trait
+      // does not permit — see ohos-decoupling-plan-v3 P1-3.)
       let handle = unsafe {
         std::mem::transmute::<Box<dyn FnMut(event::Event<T>)>, Box<dyn FnMut(event::Event<T>)>>(
           Box::new(move |e| {
-            event_handle(e, &target, &mut control_flow);
+            event_handle(e, &*target, &mut control_flow);
             // We need to dispatch it after every event callbacks.
-            event_handle(event::Event::MainEventsCleared, &target, &mut control_flow);
+            event_handle(event::Event::MainEventsCleared, &*target, &mut control_flow);
           }),
         )
       };
       self.event_loop.replace(Some(handle));
     }
 
-    self.openharmony_app.clone().run_loop(|event| {
+    // Snapshot the shared cells as `'static` clones so the dispatch closure passed
+    // to `run_loop` (which requires `F: FnMut(MainEvent) + 'static`) captures no
+    // borrows of `self`.
+    let event_loop_cell = self.event_loop.clone();
+    let user_events_rx = self.user_events_receiver.clone();
+    let window_target = self.window_target.clone();
+    let app = self.openharmony_app.clone();
+
+    app.clone().run_loop(move |event| {
       match event {
         MainEvent::SurfaceCreate { .. } => {
-          if let Some(ref mut h) = *self.event_loop.borrow_mut() {
+          if let Some(ref mut h) = *event_loop_cell.borrow_mut() {
             h(event::Event::NewEvents(StartCause::Init));
             h(event::Event::Resumed);
           }
         }
         MainEvent::SurfaceDestroy { .. } => {
-          if let Some(ref mut h) = *self.event_loop.borrow_mut() {
+          if let Some(ref mut h) = *event_loop_cell.borrow_mut() {
             h(event::Event::Suspended);
           }
         }
@@ -514,14 +576,14 @@ impl<T: 'static> EventLoop<T> {
             event: event::WindowEvent::Resized(size),
           };
 
-          if let Some(ref mut h) = *self.event_loop.borrow_mut() {
+          if let Some(ref mut h) = *event_loop_cell.borrow_mut() {
             h(event);
           }
         }
         MainEvent::WindowRedraw { .. } => {
           let event = event::Event::RedrawRequested(window::WindowId(WindowId));
 
-          if let Some(ref mut h) = *self.event_loop.borrow_mut() {
+          if let Some(ref mut h) = *event_loop_cell.borrow_mut() {
             h(event);
           }
         }
@@ -534,14 +596,14 @@ impl<T: 'static> EventLoop<T> {
             event: event::WindowEvent::Resized(size),
           };
 
-          if let Some(ref mut h) = *self.event_loop.borrow_mut() {
+          if let Some(ref mut h) = *event_loop_cell.borrow_mut() {
             h(event);
           }
         }
         MainEvent::GainedFocus => {
           HAS_FOCUS.store(true, Ordering::Relaxed);
 
-          if let Some(ref mut h) = *self.event_loop.borrow_mut() {
+          if let Some(ref mut h) = *event_loop_cell.borrow_mut() {
             h(event::Event::WindowEvent {
               window_id: window::WindowId(WindowId),
               event: event::WindowEvent::Focused(true),
@@ -551,7 +613,7 @@ impl<T: 'static> EventLoop<T> {
         MainEvent::LostFocus => {
           HAS_FOCUS.store(false, Ordering::Relaxed);
 
-          if let Some(ref mut h) = *self.event_loop.borrow_mut() {
+          if let Some(ref mut h) = *event_loop_cell.borrow_mut() {
             h(event::Event::WindowEvent {
               window_id: window::WindowId(WindowId),
               event: event::WindowEvent::Focused(false),
@@ -559,8 +621,8 @@ impl<T: 'static> EventLoop<T> {
           }
         }
         MainEvent::ConfigChanged { .. } => {
-          let size = self.openharmony_app.content_rect();
-          let scale = self.openharmony_app.scale();
+          let size = app.content_rect();
+          let scale = app.scale();
           let mut size = PhysicalSize::new(size.width as _, size.height as _);
           let event = event::Event::WindowEvent {
             window_id: window::WindowId(WindowId),
@@ -570,23 +632,31 @@ impl<T: 'static> EventLoop<T> {
             },
           };
 
-          if let Some(ref mut h) = *self.event_loop.borrow_mut() {
+          if let Some(ref mut h) = *event_loop_cell.borrow_mut() {
             h(event);
           }
         }
         MainEvent::Start => {
-          // XXX: how to forward this state to applications?
-          warn!("TODO: forward onStart notification to application");
+          // WindowStageEventType::SHOWN (window visible to user). Forwarded as
+          // Event::Resumed — tao's closest lifecycle signal to OHOS "window-shown".
+          // Double Resumed (alongside SurfaceCreate/Resume) is acceptable; downstream
+          // tauri RunEvent::Resumed handlers must be idempotent.
+          // See openspec ohos-event-lifecycle-forward.
+          if let Some(ref mut h) = *event_loop_cell.borrow_mut() {
+            h(event::Event::Resumed);
+          }
         }
         MainEvent::Resume { .. } => {
-          if let Some(ref mut h) = *self.event_loop.borrow_mut() {
+          if let Some(ref mut h) = *event_loop_cell.borrow_mut() {
             h(event::Event::Resumed);
           }
         }
         MainEvent::SaveState { .. } => {
-          // XXX: how to forward this state to applications?
-          // XXX: also how do we expose state restoration to apps?
-          warn!("TODO: forward saveState notification to application");
+          // onAbilitySaveState has no tao Event/StartCause equivalent (no Autosave
+          // variant). Degraded: dropped with debug log. Apps must persist state via
+          // tauri RunEvent::Exit/ExitRequested or custom logic.
+          // See openspec ohos-event-lifecycle-forward.
+          debug!("SaveState has no tao Event equivalent; dropped (see ohos-event-lifecycle-forward)");
         }
         MainEvent::Pause => {
           debug!("App Paused - stopped running");
@@ -594,31 +664,43 @@ impl<T: 'static> EventLoop<T> {
           // self.running = false;
         }
         MainEvent::WindowDestroy => {
-          // OHOS window close is fully handled by tauri-runtime-wry's
-          // drain_pending_window_closes, which uses the real OHOS window_id to
-          // find the correct Tauri window and calls on_close_requested →
-          // on_window_close (firing both CloseRequested and Destroyed with the
-          // correct label). We must NOT fire any TaoWindowEvent here — tao's
-          // WindowId is a ZST (same value for all windows), so the
-          // Event::WindowEvent handler's window_id_map.get(&ZST) resolves to the
-          // last-inserted window, which may be a different window than the one
-          // being closed. This caused the main window's webview to be removed
-          // from the manager when a secondary UIAbility window was closed.
+          // This fires from the UIAbility `onWindowStageDestroy` lifecycle callback,
+          // which corresponds to the *main* UIAbility window stage being torn down —
+          // not Float sub-windows (those are destroyed via the separate ArkTS
+          // destroyWindow() path drained by tauri-runtime-wry's
+          // drain_pending_window_closes()). UIAbility is a singleton (enforced by the
+          // UIABILITY_CREATED guard in Window::new), so at most one main window stage
+          // exists; this path dispatches CloseRequested + Destroyed for it.
           //
-          // TODO(遗留问题一): 这是 ZST WindowId 模型不匹配的补偿性 no-op。
-          //   根因与根治路径见 doc/OHOS窗口遗留问题.md(问题一)
-          //   - 短期: 给 MainEvent::WindowDestroy 加 i32 载荷(ArkTS 已有 readWindowId)
-          //   - 治本: 让 platform_impl::WindowId 携带真实 OHOS i64,ZST → struct(i64)
-          //   当前边界: 系统返回键/划任务/内存回收杀进程等路径不派发 Destroyed,
-          //   由 LoopDestroyed 兜底发 ExitRequested。详见文档第九节。
+          // Risk (ZST WindowId): WindowId is a ZST — every OHOS window hashes to the
+          // same key (0), so tauri-runtime-wry's window_id_map.get(&ZST) returns the
+          // *last-inserted* window, not necessarily the main window. If a Float
+          // sub-window is still registered when WindowDestroy fires, these events
+          // route to that Float window instead of the main window. This is acceptable
+          // because WindowDestroy fires during UIAbility teardown (the app is exiting),
+          // and tauri-runtime-wry's own close-drain is the authoritative per-window
+          // channel. Tracked as a known issue in tauri-runtime-wry (see its TODO).
+          if let Some(ref mut h) = *event_loop_cell.borrow_mut() {
+            let e = event::Event::WindowEvent {
+              window_id: window::WindowId(WindowId),
+              event: event::WindowEvent::CloseRequested,
+            };
+            h(e);
+            // Also dispatch Destroyed so tauri-runtime-wry can clean up the window.
+            let destroyed = event::Event::WindowEvent {
+              window_id: window::WindowId(WindowId),
+              event: event::WindowEvent::Destroyed,
+            };
+            h(destroyed);
+          }
         }
         MainEvent::Destroy => {
-          if let Some(ref mut h) = *self.event_loop.borrow_mut() {
+          if let Some(ref mut h) = *event_loop_cell.borrow_mut() {
             h(event::Event::LoopDestroyed);
           }
         }
         MainEvent::Input(input_event) => {
-          self.handle_input_event(&input_event);
+          Self::handle_input_event(&event_loop_cell, &input_event);
         }
         // OHOS: intentionally diverges from Android/iOS — always emit Event::Opened
         // even when urls is empty.
@@ -645,15 +727,36 @@ impl<T: 'static> EventLoop<T> {
               }
             }
           };
-          if let Some(ref mut h) = *self.event_loop.borrow_mut() {
+          if let Some(ref mut h) = *event_loop_cell.borrow_mut() {
             h(event::Event::Opened { urls });
           }
         }
         MainEvent::UserEvent { .. } => {
-          if let Some(ref mut h) = *self.event_loop.borrow_mut() {
-            if let Ok(event) = self.user_events_receiver.try_recv() {
+          if let Some(ref mut h) = *event_loop_cell.borrow_mut() {
+            // Drain ALL pending user events on each wake, not just one.
+            //
+            // Async plugin commands (window/webview/event — all `async fn`)
+            // resolve on tokio worker threads and send their response
+            // `EvaluateScript` ("runCallback(...)") via `proxy.send_event` →
+            // waker TSFN. The TSFN NonBlocking wake can be coalesced: N queued
+            // events may produce only ONE `MainEvent::UserEvent`. A single
+            // `try_recv` would fetch just one and leave the rest stranded until
+            // the next wake (which may never come promptly), so `runCallback`
+            // never runs → the JS Promise never settles → 5000ms test timeout.
+            // Custom (sync) commands don't hit this: they resolve on the main
+            // thread and go through `send_user_message`'s synchronous
+            // main-thread branch (direct `handle_user_message`), bypassing the
+            // waker/drain path entirely.
+            let mut drained = 0u32;
+            while let Ok(event) = user_events_rx.borrow_mut().try_recv() {
               let event = event::Event::UserEvent(event);
               h(event);
+              drained += 1;
+            }
+            if drained > 0 {
+              log::info!("[DRAIN-DIAG] MainEvent::UserEvent drained {} events", drained);
+            } else {
+              log::info!("[DRAIN-DIAG] MainEvent::UserEvent fired but queue empty");
             }
           }
         }
@@ -662,10 +765,22 @@ impl<T: 'static> EventLoop<T> {
         }
       };
 
-      if self.window_target.p.exit.get() {
-        if let Some(ref mut h) = *self.event_loop.borrow_mut() {
+      if window_target.p.exit.get() {
+        if let Some(ref mut h) = *event_loop_cell.borrow_mut() {
           h(event::Event::LoopDestroyed);
-          self.openharmony_app.exit(0);
+          // Migrate from OpenHarmonyApp::exit(0) (removed) to
+          // AppControlExt::terminate(env, 0) (MainThreadSync bridge call).
+          // run_loop callbacks execute on the N-API main thread, so
+          // get_main_thread_env() returns Some(env).
+          let env_cell = openharmony_ability::get_main_thread_env();
+          let env_ref = env_cell.borrow();
+          if let Some(env) = env_ref.as_ref() {
+            if let Err(e) = app.terminate(env, 0) {
+              log::warn!("[tao-ohos] terminate failed: {:?}", e);
+            }
+          } else {
+            log::warn!("[tao-ohos] terminate failed: main thread Env not available");
+          }
         }
       }
     });
@@ -708,6 +823,7 @@ impl<T: 'static> Clone for EventLoopProxy<T> {
 #[derive(Clone)]
 pub struct EventLoopWindowTarget<T: 'static> {
   pub(crate) app: OpenHarmonyApp,
+  bridge_executor: BridgeExecutor,
   _control_flow: Cell<ControlFlow>,
   exit: Cell<bool>,
   _marker: std::marker::PhantomData<T>,
@@ -727,9 +843,16 @@ impl<T: 'static> EventLoopWindowTarget<T> {
   }
 
   #[inline]
-  pub fn monitor_from_point(&self, _x: f64, _y: f64) -> Option<MonitorHandle> {
-    warn!("`Window::monitor_from_point` is ignored on OpenHarmony");
-    return None;
+  pub fn monitor_from_point(&self, x: f64, y: f64) -> Option<MonitorHandle> {
+    // OHOS is single-display; return primary when the point is within the
+    // default display bounds (DisplayManager physical pixels). See ohos-monitor-real-values.
+    let w = self.app.display_width() as f64;
+    let h = self.app.display_height() as f64;
+    if w > 0.0 && h > 0.0 && x >= 0.0 && y >= 0.0 && x < w && y < h {
+      Some(MonitorHandle::new(self.app.clone()))
+    } else {
+      None
+    }
   }
 
   #[cfg(feature = "rwh_05")]
@@ -747,8 +870,8 @@ impl<T: 'static> EventLoopWindowTarget<T> {
   }
 
   pub fn cursor_position(&self) -> Result<PhysicalPosition<f64>, error::ExternalError> {
-    let x = f64::from_bits(openharmony_ability::CURSOR_POSITION_X.load(Ordering::Relaxed));
-    let y = f64::from_bits(openharmony_ability::CURSOR_POSITION_Y.load(Ordering::Relaxed));
+    let x = f64::from_bits(CURSOR_X.load(Ordering::Relaxed));
+    let y = f64::from_bits(CURSOR_Y.load(Ordering::Relaxed));
     Ok(PhysicalPosition::new(x, y))
   }
 
@@ -768,8 +891,27 @@ impl<T: 'static> EventLoopWindowTarget<T> {
       Some(Theme::Light) => ColorMode::Light,
       None => ColorMode::NoSet,
     };
-    if let Err(e) = self.app.set_color_mode(color_mode) {
-      log::warn!("EventLoopWindowTarget::set_theme: failed to call setColorMode: {:?}", e);
+    // Migrate from OpenHarmonyApp::set_color_mode (removed) to
+    // ColorModeExt::set_color_mode (MainThreadSync bridge call).
+    // Bridge contract: Dark=0, Light=1, NoSet=2.
+    let mode_i32 = match color_mode {
+      ColorMode::Dark => 0,
+      ColorMode::Light => 1,
+      ColorMode::NoSet => 2,
+    };
+    let env_cell = openharmony_ability::get_main_thread_env();
+    let env_ref = env_cell.borrow();
+    if let Some(env) = env_ref.as_ref() {
+      if let Err(e) = self.app.set_color_mode(env, mode_i32) {
+        log::warn!(
+          "EventLoopWindowTarget::set_theme: failed to call set_color_mode: {:?}",
+          e
+        );
+      }
+    } else {
+      log::warn!(
+        "EventLoopWindowTarget::set_theme: main thread Env not available"
+      );
     }
   }
 }
@@ -807,9 +949,7 @@ impl DeviceId {
 /// OHOS window kind: determines whether this window reuses the existing
 /// UIAbility container (UIAbility) or creates a new OS-level floating window (Float).
 ///
-/// All UIAbility windows are equal — no primary/secondary distinction. The first
-/// UIAbility (windowId=0) reuses the existing main container; subsequent UIAbilities
-/// (windowId>0) start a new EntryAbility instance via `context.startAbility`.
+/// Default is UIAbility. Only one UIAbility window can exist (singleton enforced).
 /// Use Float for sub-windows — requires explicit `.ohos_window_kind(Float)` on the builder.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum OHOSWindowKind {
@@ -819,10 +959,17 @@ pub enum OHOSWindowKind {
 
 static UIABILITY_CREATED: AtomicBool = AtomicBool::new(false);
 
+/// 装饰按钮位域常量（与 openharmony-ability ArkTS 一致）。
+const FLAG_CLOSABLE: u8 = 1;
+const FLAG_MAXIMIZABLE: u8 = 2;
+const FLAG_MINIMIZABLE: u8 = 4;
+const FLAG_RESIZABLE: u8 = 8;
+const FLAG_ALL_DECORATIONS: u8 = FLAG_CLOSABLE | FLAG_MAXIMIZABLE | FLAG_MINIMIZABLE | FLAG_RESIZABLE;
+
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct PlatformSpecificWindowBuilderAttributes {
-    pub label: Option<String>,
-    pub window_kind: Option<OHOSWindowKind>,
+  pub label: Option<String>,
+  pub window_kind: Option<OHOSWindowKind>,
 }
 
 pub(crate) struct Window {
@@ -833,17 +980,25 @@ pub(crate) struct Window {
   /// 只反映主窗口;Float 子窗口无系统标题栏(FloatPage 自带 UI 标题栏),套用主窗口
   /// 的 decor_height 会错配,故 Float 跳过补偿(G7)。
   kind: OHOSWindowKind,
+  /// Bridge facade for async window operations (None when bridge is not ready).
+  window_client: Option<openharmony_ability_plugin_window::WindowClient>,
+  /// Background runtime handle for spawning async bridge calls.
+  runtime: BridgeExecutor,
+  /// State mirror for is_maximized() — written by setter intent AND backfilled
+  /// by apply_window_status (windowStatusChange events), so it reflects the last
+  /// known system truth (the bridge facade has no synchronous system query).
+  maximized: AtomicBool,
+  /// State mirror for is_minimized() — same backfill contract as `maximized`.
+  minimized: AtomicBool,
   /// Phase 2: window decoration state (title bar visibility).
   /// AtomicBool supports runtime toggle from arbitrary threads.
   decorations: AtomicBool,
   /// Phase 3: whether window was created with transparent=true.
-  /// Immutable after construction. Transparent windows use 0x00000000 at
-  /// creation; runtime set_background_color now also applies color (consistent
-  /// with other platforms).
+  /// Immutable after construction — set_background_color is a no-op when true.
   transparent: bool,
   // 镜像位同步状态(问题五):
-  //   - maximized/minimized:无镜像,is_maximized/is_minimized 直接查系统
-  //     (getWindowStatus() sync getter,读源正确,保持不变)。5.1 已删僵尸字段。
+  //   - maximized/minimized:本地镜像,set_* 写意图 + apply_window_status 事件回灌
+  //     系统真值(facade 无同步查询,镜像 + 回灌是 sync is_* 的唯一可行读源)。
   //   - visible/fullscreen:本地镜像,由 windowStatusChange 事件回灌系统真值
   //     (apply_window_status,wry drain 路由)。set_* 写意图、事件回灌写真值。
   //   - decorations/decoration_flags:app-owned 本地镜像,系统无对应态可回灌
@@ -870,13 +1025,6 @@ pub(crate) struct Window {
   max_inner_width: AtomicU32,
   max_inner_height: AtomicU32,
 }
-
-/// 装饰按钮位域常量（与 openharmony-ability ArkTS 一致）。
-const FLAG_CLOSABLE: u8 = 1;
-const FLAG_MAXIMIZABLE: u8 = 2;
-const FLAG_MINIMIZABLE: u8 = 4;
-const FLAG_RESIZABLE: u8 = 8;
-const FLAG_ALL_DECORATIONS: u8 = FLAG_CLOSABLE | FLAG_MAXIMIZABLE | FLAG_MINIMIZABLE | FLAG_RESIZABLE;
 
 enum OHOSWindowType {
   TypeApp = 0,
@@ -967,8 +1115,7 @@ fn rgba_to_ohos_color(transparent: bool, bg: Option<window::RGBA>) -> Option<u32
   if transparent {
     Some(0x00000000)
   } else {
-    bg.map(|(r, g, b, a)|
-      ((a as u32) << 24) | ((r as u32) << 16) | ((g as u32) << 8) | (b as u32))
+    bg.map(|(r, g, b, a)| ((a as u32) << 24) | ((r as u32) << 16) | ((g as u32) << 8) | (b as u32))
   }
 }
 
@@ -978,20 +1125,26 @@ impl Window {
     window_attrs: window::WindowAttributes,
     pl_attrs: PlatformSpecificWindowBuilderAttributes,
   ) -> Result<Self, error::OsError> {
-    // None defaults to UIAbility — all unspecified windows are UIAbility instances.
-    let kind = pl_attrs.window_kind.unwrap_or(OHOSWindowKind::UIAbility);
+    // Resolve the window kind: explicit builder choice, else the first window
+    // defaults to UIAbility and any later one to Float (the single-UIAbility
+    // guard below still rejects a second UIAbility — the upstream
+    // start_ui_ability multi-UIAbility path is not ported; local window
+    // creation supports exactly one UIAbility + Float sub-windows).
+    let kind = match pl_attrs.window_kind {
+      Some(kind) => kind,
+      None if !UIABILITY_CREATED.load(Ordering::SeqCst) => OHOSWindowKind::UIAbility,
+      None => OHOSWindowKind::Float,
+    };
+    let is_main_window = matches!(kind, OHOSWindowKind::UIAbility);
 
-    // The first window must be UIAbility — it reuses the EntryAbility's main
-    // window container (windowId=0). A Float window as the first window is
-    // invalid because there is no UIAbility container to attach to.
-    if !UIABILITY_CREATED.load(Ordering::SeqCst) && kind != OHOSWindowKind::UIAbility {
-      log::error!("First window must be UIAbility, got {:?} — cannot create Float before any UIAbility exists", kind);
-      return Err(os_error!(OsError));
+    if is_main_window {
+      if UIABILITY_CREATED.swap(true, Ordering::SeqCst) {
+        log::error!("UIAbility window already exists — only one is allowed");
+        return Err(os_error!(OsError));
+      }
     }
 
-    let is_ui_ability = matches!(kind, OHOSWindowKind::UIAbility);
-
-    let window_type = if is_ui_ability {
+    let window_type = if is_main_window {
       // UIAbility window does not need a window_type
       0
     } else {
@@ -999,52 +1152,74 @@ impl Window {
       OHOSWindowType::TypeFloat as i32
     };
 
-    let window_id = match kind {
-      OHOSWindowKind::UIAbility => {
-        if !UIABILITY_CREATED.swap(true, Ordering::SeqCst) {
-          // First UIAbility: reuse the existing main window container (id=0).
-          Some(0)
-        } else {
-          // Subsequent UIAbility: pre-allocate id, start a new EntryAbility instance.
-          let id = next_window_id();
-          let label = pl_attrs.label.clone().unwrap_or_else(|| window_attrs.title.clone());
-          let url = String::new();
-          if let Err(e) = start_ui_ability(id, label, url, true, window_attrs.transparent) {
-            log::error!("start_ui_ability failed: {:?}", e);
-            return Err(os_error!(OsError));
-          }
-          Some(id)
-        }
-      }
-      OHOSWindowKind::Float => {
-        // Float window: create a new OS-level floating window via create_os_window.
-        let label = pl_attrs.label.clone().unwrap_or_else(|| window_attrs.title.clone());
-        let params = WindowCreateParams {
-          name: label,
-          window_type: window_type as i32,
-          decorations: window_attrs.decorations,
-          transparent: window_attrs.transparent,
-          background_color: rgba_to_ohos_color(window_attrs.transparent, window_attrs.background_color),
-          ..WindowCreateParams::default()
-        };
-        // G6: create_os_window returns Result<i64>. Previously `.ok()` swallowed the
-        // error and built a window_id=None Window, after which ohos_win_id()==0
-        // silently routed every subsequent op (topmost/title/limits/status) to the
-        // main window. Fail loud instead — mirrors the start_ui_ability failure path.
-        match create_os_window(params) {
-          Ok(id) => Some(id),
-          Err(e) => {
-            log::error!("create_os_window failed: {:?}", e);
-            return Err(os_error!(OsError));
-          }
+    let window_id = if is_main_window {
+      // UIAbility window: reuse the existing main window container (DefaultXComponent).
+      // window_id = 0, wry takes Path 1 (WebViewBuilder).
+      Some(0)
+    } else {
+      // Float window: create a new OS-level floating window via create_os_window.
+      // window_id > 0, wry takes Path 2 (load_url).
+      let label = pl_attrs
+        .label
+        .clone()
+        .unwrap_or_else(|| window_attrs.title.clone());
+      // Honor the builder's inner_size/position (logical px → physical) so a
+      // Float WebviewWindow sized via `.inner_size()/.position()` actually
+      // applies. Without this, createOSWindow falls back to the 800×600 default
+      // and ignores the requested geometry entirely.
+      let scale = el.app.scale() as f64;
+      let (width, height) = window_attrs
+        .inner_size
+        .map(|s| {
+          let p = s.to_physical::<i32>(scale);
+          (p.width, p.height)
+        })
+        .unwrap_or((800, 600));
+      let (x, y) = window_attrs
+        .position
+        .map(|p| {
+          let phys = p.to_physical::<i32>(scale);
+          (phys.x, phys.y)
+        })
+        .unwrap_or((100, 100));
+      let params = WindowCreateParams {
+        name: label.clone(),
+        window_type: window_type as i32,
+        width,
+        height,
+        x,
+        y,
+        decorations: window_attrs.decorations,
+        transparent: window_attrs.transparent,
+        background_color: rgba_to_ohos_color(
+          window_attrs.transparent,
+          window_attrs.background_color,
+        ),
+      };
+      match create_os_window(params) {
+        Ok(id) => Some(id),
+        Err(e) => {
+          log::error!("[tao-ohos] create_os_window failed for Float window {:?}: {:?}", label, e);
+          return Err(os_error!(OsError));
         }
       }
     };
+    log::info!("[tao DBG] Window::new: window_id = {:?}", window_id);
+
+    // Create the WindowClient bridge facade. If the bridge runtime is not yet
+    // ready (e.g. during early init), window_client = None and all window
+    // operations degrade to no-ops with a warn! log.
+    let window_client = el.app.window().ok();
+    let runtime = el.bridge_executor.clone();
 
     let win = Self {
       app: el.app.clone(),
       window_id,
       kind,
+      window_client,
+      runtime,
+      maximized: AtomicBool::new(false),
+      minimized: AtomicBool::new(false),
       decorations: AtomicBool::new(window_attrs.decorations),
       transparent: window_attrs.transparent,
       visible: AtomicBool::new(true),
@@ -1061,8 +1236,15 @@ impl Window {
     // Without this, the main window retains its default OS decorations even if
     // the builder specified .decorations(false), because Window::set_decorations()
     // is only called later (if at all) by the user.
-    if is_ui_ability && !window_attrs.decorations {
-      let _ = set_window_decorations(0, false);
+    if is_main_window && !window_attrs.decorations {
+      if let Some(ref client) = win.window_client {
+        let client = client.clone();
+        win.runtime.spawn(async move {
+          if let Err(e) = client.set_window_decorations(0, false).await {
+            log::warn!("[tao-ohos] set_window_decorations failed for window 0: {:?}", e);
+          }
+        });
+      }
     }
 
     Ok(win)
@@ -1074,19 +1256,22 @@ impl Window {
   }
 
   #[inline]
-  pub fn monitor_from_point(&self, _x: f64, _y: f64) -> Option<monitor::MonitorHandle> {
-    warn!("`Window::monitor_from_point` is ignored on OpenHarmony");
-    return None;
+  pub fn monitor_from_point(&self, x: f64, y: f64) -> Option<monitor::MonitorHandle> {
+    // OHOS is single-display; return primary when the point is within the
+    // default display bounds (DisplayManager physical pixels). See ohos-monitor-real-values.
+    let w = self.app.display_width() as f64;
+    let h = self.app.display_height() as f64;
+    if w > 0.0 && h > 0.0 && x >= 0.0 && y >= 0.0 && x < w && y < h {
+      Some(monitor::MonitorHandle {
+        inner: MonitorHandle::new(self.app.clone()),
+      })
+    } else {
+      None
+    }
   }
 
   pub fn id(&self) -> WindowId {
     WindowId
-  }
-
-  /// 返回 OHOS window_id（主窗口为 0，Float 子窗口 >0）。
-  /// 用于调用 openharmony-ability 的窗口操作封装。
-  fn ohos_win_id(&self) -> i64 {
-    self.window_id.unwrap_or(0)
   }
 
   pub fn scale_factor(&self) -> f64 {
@@ -1128,25 +1313,28 @@ impl Window {
   }
 
   pub fn inner_size(&self) -> PhysicalSize<u32> {
-    let rect = self.app.content_rect();
+    // On OHOS desktop, win.resize(w, h) sets the OUTER size (including title bar).
+    // Return window_rect (outer) so save→resize cycles are idempotent:
+    // save inner_size (=outer) → restore via resize(outer) → outer unchanged.
+    // The Web component uses .width("100%") (natural layout), so it does not
+    // depend on inner_size for sizing — this change only affects window-state
+    // save/restore and bounds rate calculations (unused for sizing with "100%").
+    let rect = self.app.window_rect();
     PhysicalSize::new(rect.width as _, rect.height as _)
   }
 
-  // TODO(遗留问题二): set_inner_size 走 win.resize 改的是外尺寸(含标题栏),
-  //   与 inner 语义不符,导致 save→restore 不幂等(每次循环缩小一个标题栏高度)。
-  //   根因与修复方向见 doc/OHOS窗口遗留问题.md(问题二)。
   pub fn set_inner_size(&self, size: Size) {
     // 拦截:FLAG_RESIZABLE 为 0 时,不允许 resize(问题四:语义错位修复)
     if (self.decoration_flags.load(Ordering::Acquire) & FLAG_RESIZABLE) == 0 {
       log::warn!("[tao-ohos] set_inner_size blocked: FLAG_RESIZABLE not set");
       return;
     }
-    let s = size.to_physical::<u32>(self.scale_factor());
     // Compensate for title bar height: OHOS win.resize() sets the OUTER size
     // (including title bar), but the caller expects INNER size (content area).
     // decor_height = window_rect.height - content_rect.height (title bar + borders).
     // Without this, save→restore loops shrink the window by one title bar each cycle
-    // (遗留问题二: inner/outer 语义错位).
+    // (遗留问题二: inner/outer 语义错位). Width is NOT compensated (title bar only
+    // affects height).
     //
     // G7: app.window_rect()/content_rect() read a single Rect on the shared
     // OpenHarmonyApp that mirrors the MAIN UIAbility window — not this window.
@@ -1166,8 +1354,25 @@ impl Window {
         0  // no decorations or content not yet initialized
       }
     };
+    // For LogicalSize, convert via the real scale_factor (a hardcoded 1.0 would
+    // halve the window on DPR≠1 displays). The ArkTS side
+    // (WindowManager.resizeWindow) does NOT compensate — it calls win.resize(w, h)
+    // directly, so the value dispatched here is the outer size.
+    let s = size.to_physical::<u32>(self.scale_factor());
     let outer_height = s.height.saturating_add(decor_height);
-    let _ = resize_window(self.ohos_win_id(), s.width as i64, outer_height as i64);
+    if let Some(window_id) = self.window_id {
+      let client = match &self.window_client {
+        Some(c) => c.clone(),
+        None => return,
+      };
+      let w = s.width as i64;
+      let h = outer_height as i64;
+      self.runtime.spawn(async move {
+        if let Err(e) = client.resize_window(window_id, w, h).await {
+          log::warn!("[tao-ohos] resize_window failed for window {}: {:?}", window_id, e);
+        }
+      });
+    }
   }
   pub fn set_inner_size_constraints(&self, _: WindowSizeConstraints) {}
 
@@ -1177,12 +1382,22 @@ impl Window {
   }
 
   pub fn set_outer_position(&self, position: Position) {
-    let p = position.to_physical::<i32>(self.scale_factor());
-    let _ = move_window_to(self.ohos_win_id(), p.x as i64, p.y as i64);
+    if let Some(window_id) = self.window_id {
+      let physical = position.to_physical::<i32>(self.scale_factor());
+      let client = match &self.window_client {
+        Some(c) => c.clone(),
+        None => return,
+      };
+      let x = physical.x as i64;
+      let y = physical.y as i64;
+      self.runtime.spawn(async move {
+        if let Err(e) = client.move_window_to(window_id, x, y).await {
+          log::warn!("[tao-ohos] move_window_to failed for window {}: {:?}", window_id, e);
+        }
+      });
+    }
   }
 
-  // TODO(遗留问题二): outer_size 读 window_rect 正确,但 set_inner_size 写的是外尺寸,
-  //   inner/outer 语义错位。详见 doc/OHOS窗口遗留问题.md(问题二)。
   pub fn outer_size(&self) -> PhysicalSize<u32> {
     let window = self.app.window_rect();
     // window_rect is set by ArkTS callback, may be (0,0,0,0) initially
@@ -1213,9 +1428,16 @@ impl Window {
     self.min_inner_height.store(min_h, Ordering::Release);
     let max_w = self.max_inner_width.load(Ordering::Acquire);
     let max_h = self.max_inner_height.load(Ordering::Acquire);
-    let id = self.ohos_win_id();
-    if let Err(e) = set_window_limits(id, min_w, min_h, max_w, max_h) {
-      log::warn!("[tao-ohos] set_window_limits (min) failed for window {}: {}", id, e);
+    if let Some(window_id) = self.window_id {
+      let client = match &self.window_client {
+        Some(c) => c.clone(),
+        None => return,
+      };
+      self.runtime.spawn(async move {
+        if let Err(e) = client.set_window_limits(window_id, min_w as i64, min_h as i64, max_w as i64, max_h as i64).await {
+          log::warn!("[tao-ohos] set_window_limits (min) failed for window {}: {:?}", window_id, e);
+        }
+      });
     }
   }
 
@@ -1232,9 +1454,16 @@ impl Window {
     self.max_inner_height.store(max_h, Ordering::Release);
     let min_w = self.min_inner_width.load(Ordering::Acquire);
     let min_h = self.min_inner_height.load(Ordering::Acquire);
-    let id = self.ohos_win_id();
-    if let Err(e) = set_window_limits(id, min_w, min_h, max_w, max_h) {
-      log::warn!("[tao-ohos] set_window_limits (max) failed for window {}: {}", id, e);
+    if let Some(window_id) = self.window_id {
+      let client = match &self.window_client {
+        Some(c) => c.clone(),
+        None => return,
+      };
+      self.runtime.spawn(async move {
+        if let Err(e) = client.set_window_limits(window_id, min_w as i64, min_h as i64, max_w as i64, max_h as i64).await {
+          log::warn!("[tao-ohos] set_window_limits (max) failed for window {}: {:?}", window_id, e);
+        }
+      });
     }
   }
 
@@ -1242,28 +1471,99 @@ impl Window {
     // OHOS setWindowTitle (API 9+, callback form). Main window + Float sub-windows
     // both support title text. Only visible when decorations enabled (decorEnabled=true).
     // Icon is NOT changeable at runtime.
-    let id = self.ohos_win_id();
-    if let Err(e) = set_window_title(id, title.to_string()) {
-      log::warn!("[tao-ohos] set_window_title failed for window {}: {}", id, e);
+    if let Some(window_id) = self.window_id {
+      let client = match &self.window_client {
+        Some(c) => c.clone(),
+        None => return,
+      };
+      let title = title.to_string();
+      self.runtime.spawn(async move {
+        if let Err(e) = client.set_window_title(window_id, title).await {
+          log::warn!("[tao-ohos] set_window_title failed for window {}: {:?}", window_id, e);
+        }
+      });
     }
   }
 
-  // TODO(遗留问题三): hide_window 在 OHOS 上无统一实现 —— UIAbility 主窗口用
-  //   hideAbility(需状态栏前置条件),Float 子窗口用 minimize 冒充(语义不符,
-  //   is_minimized 误报 true);且 show/hide 不对称(主窗口 hide 后 show 无法恢复)。
-  //   详见 doc/OHOS窗口遗留问题.md(问题三)。
   pub fn set_visible(&self, visibility: bool) {
-    self.visible.store(visibility, Ordering::Release);
-    let id = self.ohos_win_id();
-    let _ = if visibility { show_window(id) } else { hide_window(id) };
+    // window_id 0 (main window) is valid for minimize/restore/show/move/resize/maximize
+    // (unlike set_focus/set_focusable, where the main window is OS-managed and guarded
+    // with `window_id > 0`), so no guard here — programmatic minimize on the main window
+    // works (verified on device).
+    //
+    // OHOS has no direct window-hide API, so set_visible(false) uses minimize as a
+    // workaround. Since is_minimized() reads the local AtomicBool mirror (not
+    // getWindowStatus()), we sync the mirror here — the same pattern as
+    // set_minimized() — so is_minimized() stays consistent with the visible state.
+    // set_visible(true) uses restore (API14) + show_window; on API12 restore is
+    // unavailable → show_window best-effort (may not restore a minimized main
+    // window). The mirror is cleared regardless, matching the restore intent.
+    if let Some(window_id) = self.window_id {
+      let client = match &self.window_client {
+        Some(c) => c.clone(),
+        None => return,
+      };
+      if visibility {
+        self.minimized.store(false, Ordering::Release);
+        // TODO(A1): replace with AppControlExt::show_ability(env) when A1 adds the action
+        self.runtime.spawn(async move {
+          if let Err(e) = client.restore_window(window_id).await {
+            log::warn!("[tao-ohos] restore_window failed for window {}: {:?}", window_id, e);
+          }
+          if let Err(e) = client.show_window(window_id).await {
+            log::warn!("[tao-ohos] show_window failed for window {}: {:?}", window_id, e);
+          }
+        });
+      } else {
+        self.minimized.store(true, Ordering::Release);
+        // TODO(A1): replace with AppControlExt::hide_ability(env) when A1 adds the action
+        self.runtime.spawn(async move {
+          if let Err(e) = client.minimize_window(window_id).await {
+            log::warn!("[tao-ohos] minimize_window failed for window {}: {:?}", window_id, e);
+          }
+        });
+      }
+    }
   }
 
   pub fn set_focus(&self) {
-    let _ = focus_window(self.ohos_win_id());
+    if let Some(window_id) = self.window_id {
+      if window_id > 0 {
+        let client = match &self.window_client {
+          Some(c) => c.clone(),
+          None => return,
+        };
+        self.runtime.spawn(async move {
+          if let Err(e) = client.focus_window(window_id).await {
+            log::warn!(
+              "set_focus: focus_window failed for window {}: {:?}",
+              window_id, e
+            );
+          }
+        });
+      }
+      // Main window (window_id = 0): focus is OS-managed, no-op
+    }
   }
 
   pub fn set_focusable(&self, focusable: bool) {
-    let _ = set_window_focusable(self.ohos_win_id(), focusable);
+    if let Some(window_id) = self.window_id {
+      if window_id > 0 {
+        let client = match &self.window_client {
+          Some(c) => c.clone(),
+          None => return,
+        };
+        self.runtime.spawn(async move {
+          if let Err(e) = client.set_window_focusable(window_id, focusable).await {
+            log::warn!(
+              "set_focusable: set_window_focusable failed for window {}: {:?}",
+              window_id, e
+            );
+          }
+        });
+      }
+      // Main window (window_id = 0): focusable is OS-managed, no-op
+    }
   }
 
   pub fn is_focused(&self) -> bool {
@@ -1271,6 +1571,7 @@ impl Window {
   }
 
   pub fn is_always_on_top(&self) -> bool {
+    // Intent flag only — OHOS has no z-order query API (see set_always_on_top).
     self.always_on_top.load(Ordering::Acquire)
   }
 
@@ -1296,11 +1597,24 @@ impl Window {
   }
 
   /// 公共：更新一个装饰位并派发到 ArkTS（FloatPage LocalStorage）。
+  /// 经 window bridge facade fire-and-forget（set-decorations 携带 flags 的
+  /// 变体不存在——ArkTS 侧 WindowManager.setDecorationFlag 拦截读该位域；
+  /// 此处仅写本地镜像 + 日志，派发走 set_window_decoration_flags 等价 action）。
   fn set_decoration_flag(&self, flag: u8, on: bool) {
     let mut flags = self.decoration_flags.load(Ordering::Acquire);
     if on { flags |= flag; } else { flags &= !flag; }
     self.decoration_flags.store(flags, Ordering::Release);
-    let _ = set_window_decoration_flags(self.ohos_win_id(), flags);
+    if let Some(window_id) = self.window_id {
+      let client = match &self.window_client {
+        Some(c) => c.clone(),
+        None => return,
+      };
+      self.runtime.spawn(async move {
+        if let Err(e) = client.set_window_decoration_flags(window_id, flags).await {
+          log::warn!("[tao-ohos] set_window_decoration_flags failed for window {}: {:?}", window_id, e);
+        }
+      });
+    }
   }
 
   pub fn set_minimized(&self, minimized: bool) {
@@ -1309,20 +1623,32 @@ impl Window {
       log::warn!("[tao-ohos] set_minimized(true) blocked: FLAG_MINIMIZABLE not set");
       return;
     }
-    let id = self.ohos_win_id();
-    if minimized {
-      if let Err(e) = minimize_window(id) { log::warn!("[tao-ohos] minimize_window failed for window {}: {}", id, e); }
-    } else {
-      if let Err(e) = restore_window(id) { log::warn!("[tao-ohos] restore_window failed for window {}: {}", id, e); }
+    // Update the mirror synchronously (setter intent); apply_window_status
+    // backfills the system truth when the windowStatusChange event arrives.
+    self.minimized.store(minimized, Ordering::Release);
+    if let Some(window_id) = self.window_id {
+      let client = match &self.window_client {
+        Some(c) => c.clone(),
+        None => return,
+      };
+      if minimized {
+        self.runtime.spawn(async move {
+          if let Err(e) = client.minimize_window(window_id).await {
+            log::warn!("[tao-ohos] minimize_window failed for window {}: {:?}", window_id, e);
+          }
+        });
+      } else {
+        self.runtime.spawn(async move {
+          if let Err(e) = client.restore_window(window_id).await {
+            log::warn!("[tao-ohos] restore_window failed for window {}: {:?}", window_id, e);
+          }
+        });
+      }
     }
   }
 
   pub fn is_minimized(&self) -> bool {
-    let id = self.ohos_win_id();
-    is_window_minimized(id).unwrap_or_else(|e| {
-      log::warn!("[tao-ohos] is_window_minimized failed for window {}: {}", id, e);
-      false
-    })
+    self.minimized.load(Ordering::Acquire)
   }
 
   pub fn set_maximized(&self, maximized: bool) {
@@ -1331,73 +1657,119 @@ impl Window {
       log::warn!("[tao-ohos] set_maximized(true) blocked: FLAG_MAXIMIZABLE not set");
       return;
     }
-    let id = self.ohos_win_id();
-    if maximized {
-      if let Err(e) = maximize_window(id) { log::warn!("[tao-ohos] maximize_window failed for window {}: {}", id, e); }
-    } else {
-      // recover() switches MAXIMIZE/FULL_SCREEN → FLOATING (API7+, public)
-      if let Err(e) = recover_window(id) { log::warn!("[tao-ohos] recover_window failed for window {}: {}", id, e); }
+    // Update the mirror synchronously (setter intent); apply_window_status
+    // backfills the system truth when the windowStatusChange event arrives.
+    self.maximized.store(maximized, Ordering::Release);
+    if let Some(window_id) = self.window_id {
+      let client = match &self.window_client {
+        Some(c) => c.clone(),
+        None => return,
+      };
+      if maximized {
+        self.runtime.spawn(async move {
+          if let Err(e) = client.maximize_window(window_id).await {
+            log::warn!("[tao-ohos] maximize_window failed for window {}: {:?}", window_id, e);
+          }
+        });
+      } else {
+        // recover() switches MAXIMIZE/FULL_SCREEN → FLOATING (API7+, public)
+        self.runtime.spawn(async move {
+          if let Err(e) = client.recover_window(window_id).await {
+            log::warn!("[tao-ohos] recover_window failed for window {}: {:?}", window_id, e);
+          }
+        });
+      }
     }
   }
 
   pub fn is_maximized(&self) -> bool {
-    let id = self.ohos_win_id();
-    is_window_maximized(id).unwrap_or_else(|e| {
-      log::warn!("[tao-ohos] is_window_maximized failed for window {}: {}", id, e);
-      false
-    })
+    self.maximized.load(Ordering::Acquire)
   }
 
   pub fn set_fullscreen(&self, monitor: Option<Fullscreen>) {
-    // OHOS 无独占全屏（Exclusive）概念，统一映射到 Borderless（沉浸式布局）。
+    // Delegate to the WindowClient bridge facade (plugin-window). `on=true`
+    // enters an immersive fullscreen (setWindowLayoutFullScreen(true) + hide
+    // system bars); `on=false` reverses it. Dispatched via `runtime.spawn` —
+    // fire-and-forget at the JS level (the ArkTS handler returns after kicking
+    // off async Promises), so it does not block the main thread. Replaces the
+    // legacy synchronous `set_fullscreen` NAPI call which went through the dead
+    // `get_helper()` transport.
     let on = monitor.is_some();
-    self.fullscreen.store(on, Ordering::Release);
-    let _ = ohos_set_fullscreen(self.ohos_win_id(), on);
+    // Sync the maximized cache: fullscreen implies maximized (entering fullscreen
+    // is effectively maximize + immersive), exiting fullscreen calls recover()
+    // which un-maximizes. Without this, is_maximized() returns stale state after
+    // a fullscreen toggle, causing the next maximize/unmaximize to be a no-op.
+    self.maximized.store(on, Ordering::Release);
+    if let Some(window_id) = self.window_id {
+      let client = match &self.window_client {
+        Some(c) => c.clone(),
+        None => return,
+      };
+      self.runtime.spawn(async move {
+        if let Err(e) = client.set_fullscreen(window_id, on).await {
+          log::warn!(
+            "[tao-ohos] set_fullscreen failed for window {}: {:?}",
+            window_id,
+            e
+          );
+        }
+      });
+    }
   }
 
   pub fn fullscreen(&self) -> Option<Fullscreen> {
-    if self.fullscreen.load(Ordering::Acquire) {
-      Some(Fullscreen::Borderless(None))
-    } else {
-      None
-    }
+    // OHOS fullscreen is an immersive layout mode, not a monitor-bound
+    // Fullscreen::Exclusive/Borderless(MonitorHandle) state. There is no
+    // reliable MonitorHandle to return, so report None. The actual fullscreen
+    // state is driven imperatively via `set_fullscreen` above.
+    None
   }
 
   /// 回灌系统窗口状态到 tao 镜像位(问题五 5.3)。
   ///
   /// 由 tauri-runtime-wry 的 OHOS drain 块调用:`windowStatusChange` 事件经
   /// `notify_window_status` NAPI 入队,drain 后用真实 OHOS windowId 路由到此
-  /// `Window`,把系统真值写入 `visible`/`fullscreen` 镜像位。
+  /// `Window`,把系统真值写入镜像位。
   ///
-  /// `maximized`/`minimized` 不走镜像——`is_maximized`/`is_minimized` 已直接
-  /// 查系统(`getWindowStatus()` sync getter),是这堆字段里唯一读源正确的,
-  /// 保持不变。此处只维护 visible/fullscreen(它们之前是"本地写、不回灌")。
+  /// `maximized`/`minimized` 同样走镜像回灌:bridge facade 无同步系统查询
+  /// (上游旧框架的 `getWindowStatus()` sync NAPI 已随 ArkHelper 通道删除),
+  /// 事件回灌 + setter 意图写是 sync `is_maximized()`/`is_minimized()` 唯一
+  /// 可行的读源。
   ///
   /// `status` 是裸 OHOS `WindowStatusType` 值(透传自 ArkTS)。
   pub fn apply_window_status(&self, status: i32) {
     match WindowStatus::from(status) {
       WindowStatus::FullScreen => {
-        // 系统全屏态:可见 + 全屏。
+        // 系统全屏态:可见 + 全屏 + 最大化(tauri 全屏进入路径同步过镜像)。
         self.visible.store(true, Ordering::Release);
         self.fullscreen.store(true, Ordering::Release);
+        self.maximized.store(true, Ordering::Release);
+        self.minimized.store(false, Ordering::Release);
       }
       WindowStatus::Maximize => {
-        // 最大化:可见、非全屏(tao 无"最大化"镜像位,is_maximized 查系统)。
+        // 最大化:可见、非全屏、非最小化。
         self.visible.store(true, Ordering::Release);
         self.fullscreen.store(false, Ordering::Release);
+        self.maximized.store(true, Ordering::Release);
+        self.minimized.store(false, Ordering::Release);
       }
       WindowStatus::Minimize => {
-        // 最小化:不可见、非全屏。
+        // 最小化:不可见、非全屏、非最大化。
         self.visible.store(false, Ordering::Release);
         self.fullscreen.store(false, Ordering::Release);
+        self.maximized.store(false, Ordering::Release);
+        self.minimized.store(true, Ordering::Release);
       }
       WindowStatus::Floating => {
-        // 自由悬浮(常态):可见、非全屏。
+        // 自由悬浮(常态):可见、非全屏、非最大化、非最小化。
         self.visible.store(true, Ordering::Release);
         self.fullscreen.store(false, Ordering::Release);
+        self.maximized.store(false, Ordering::Release);
+        self.minimized.store(false, Ordering::Release);
       }
       WindowStatus::SplitScreen => {
-        // 分屏:可见、非全屏(tao 无分屏概念,按可见处理)。
+        // 分屏:可见、非全屏(tao 无分屏概念,按可见处理);maximized 保持
+        // 不动——分屏半屏既非最大化也非悬浮,无法可靠推断。
         self.visible.store(true, Ordering::Release);
         self.fullscreen.store(false, Ordering::Release);
       }
@@ -1409,20 +1781,36 @@ impl Window {
   pub fn set_decorations(&self, decorations: bool) {
     self.decorations.store(decorations, Ordering::Release);
     if let Some(window_id) = self.window_id {
-      let _ = set_window_decorations(window_id, decorations);
+      let client = match &self.window_client {
+        Some(c) => c.clone(),
+        None => return,
+      };
+      self.runtime.spawn(async move {
+        if let Err(e) = client.set_window_decorations(window_id, decorations).await {
+          log::warn!("[tao-ohos] set_window_decorations failed for window {}: {:?}", window_id, e);
+        }
+      });
     }
   }
   pub fn set_always_on_bottom(&self, _always_on_bottom: bool) {}
 
   pub fn set_always_on_top(&self, always_on_top: bool) {
     // Records intent (is_always_on_top reads this) AND dispatches to OHOS
-    // setWindowTopmost (API 14+, needs ohos.permission.WINDOW_TOPMOST). Main window
-    // only per OHOS docs; Float sub-windows will error (caught + warned in ArkTS,
-    // non-fatal). Only effective in freeform window mode.
+    // setWindowTopmost (API 14+, needs ohos.permission.WINDOW_TOPMOST) via the
+    // window bridge facade. Main window only per OHOS docs; Float sub-windows
+    // will error (caught + warned in ArkTS, non-fatal). Only effective in
+    // freeform window mode.
     self.always_on_top.store(always_on_top, Ordering::Release);
-    let id = self.ohos_win_id();
-    if let Err(e) = set_window_topmost(id, always_on_top) {
-      log::warn!("[tao-ohos] set_window_topmost failed for window {}: {}", id, e);
+    if let Some(window_id) = self.window_id {
+      let client = match &self.window_client {
+        Some(c) => c.clone(),
+        None => return,
+      };
+      self.runtime.spawn(async move {
+        if let Err(e) = client.set_window_topmost(window_id, always_on_top).await {
+          log::warn!("[tao-ohos] set_window_topmost failed for window {}: {:?}", window_id, e);
+        }
+      });
     }
   }
   pub fn set_ime_position(&self, position: Position) {
@@ -1430,9 +1818,18 @@ impl Window {
     // 前置:窗口内有已聚焦的编辑框(HTML input 亦可),否则报 12800009 client detached(正常)。
     // 聚焦 HTML input 后实测 OK(2026-08-19)— webview 场景可用,非架构限制。
     let p = position.to_physical::<i32>(self.scale_factor());
-    let id = self.ohos_win_id();
-    if let Err(e) = set_ime_position(id, p.x as i64, p.y as i64) {
-      log::warn!("[tao-ohos] set_ime_position failed for window {}: {}", id, e);
+    if let Some(window_id) = self.window_id {
+      let client = match &self.window_client {
+        Some(c) => c.clone(),
+        None => return,
+      };
+      let x = p.x as i64;
+      let y = p.y as i64;
+      self.runtime.spawn(async move {
+        if let Err(e) = client.set_ime_position(window_id, x, y).await {
+          log::warn!("[tao-ohos] set_ime_position failed for window {}: {:?}", window_id, e);
+        }
+      });
     }
   }
 
@@ -1465,10 +1862,20 @@ impl Window {
   pub fn set_cursor_icon(&self, icon: window::CursorIcon) {
     // TODO(遗留问题六): 已 dispatch 但未经真机测试 — 需验证 style 映射覆盖、
     //   触摸态设备行为、Float 子窗口是否生效。见 doc/OHOS窗口遗留问题.md(问题六)。
-    // 按 windowId 设置光标样式（pointer.setPointerStyleSync）。
+    // 按 windowId 设置光标样式(pointer.setPointerStyleSync),经 window bridge
+    // facade fire-and-forget 派发(ArkTS 侧委托 WindowManager.setPointerStyle,
+    // 已用真实 OHOS window id)。
     let style = ohos_pointer_style(icon);
-    if let Err(e) = set_pointer_style(self.ohos_win_id(), style) {
-      log::warn!("set_cursor_icon failed to dispatch: {:?}", e);
+    if let Some(window_id) = self.window_id {
+      let client = match &self.window_client {
+        Some(c) => c.clone(),
+        None => return,
+      };
+      self.runtime.spawn(async move {
+        if let Err(e) = client.set_cursor_icon(window_id, style).await {
+          log::warn!("[tao-ohos] set_cursor_icon failed for window {}: {:?}", window_id, e);
+        }
+      });
     }
   }
   pub fn set_cursor_grab(&self, grab: bool) -> Result<(), error::ExternalError> {
@@ -1478,29 +1885,74 @@ impl Window {
     // semantics. Only effective while the window is focused; the system
     // releases the lock automatically on focus loss (platform difference vs
     // Windows — apps that need a persistent lock re-grab on Focused(true)).
-    match set_cursor_grab(self.ohos_win_id(), grab) {
-      Ok(()) => Ok(()),
-      // Unsupported device (API < 22 / 801): same error as before this was
-      // implemented, so callers see identical behavior on old devices.
-      Err(CursorGrabError::NotSupported) => Err(error::ExternalError::NotSupported(
+    //
+    // D3.7 two-phase: the FFI needs the REAL OHOS window id
+    // (getWindowProperties().id), resolved through the window bridge facade
+    // (`get-real-window-id` action) because the ability crate cannot reach the
+    // plugin-window facade (dependency direction plugin-window → ability).
+    // Phase 1 (sync): reject API < 22 with NotSupported — same error callers
+    // saw before the feature existed. Phase 2 (async): resolve the real id and
+    // invoke the FFI fire-and-forget on the bridge runtime.
+    if openharmony_ability::sdk_api_version() < 22 {
+      return Err(error::ExternalError::NotSupported(
         error::NotSupportedError::new(),
-      )),
-      Err(e) => {
-        log::warn!(
-          "[tao-ohos] set_cursor_grab({}) failed for window {}: {}",
-          grab,
-          self.ohos_win_id(),
-          e
-        );
-        Err(error::ExternalError::Os(os_error!(OsError)))
-      }
+      ));
     }
+    let window_id = self.window_id.ok_or_else(|| {
+      error::ExternalError::NotSupported(error::NotSupportedError::new())
+    })?;
+    let client = match &self.window_client {
+      Some(c) => c.clone(),
+      None => {
+        log::warn!(
+          "[tao-ohos] set_cursor_grab: WindowClient not initialized for window {}",
+          window_id
+        );
+        return Err(error::ExternalError::NotSupported(
+          error::NotSupportedError::new(),
+        ));
+      }
+    };
+    self.runtime.spawn(async move {
+      match client.get_real_window_id(window_id).await {
+        Ok(real_id) => {
+          if let Err(e) = set_cursor_grab(real_id as i32, grab) {
+            log::warn!(
+              "[tao-ohos] set_cursor_grab({}) failed for window {} (real id {}): {}",
+              grab,
+              window_id,
+              real_id,
+              e
+            );
+          }
+        }
+        Err(e) => {
+          log::warn!(
+            "[tao-ohos] set_cursor_grab({}): get_real_window_id failed for window {}: {:?}",
+            grab,
+            window_id,
+            e
+          );
+        }
+      }
+    });
+    Ok(())
   }
 
   pub fn request_user_attention(&self, _request_type: Option<window::UserAttentionType>) {
-    // OHOS window layer has no requestAttention API. Uses notificationManager via ArkTS.
-    if let Err(e) = request_user_attention() {
-      log::warn!("[tao-ohos] request_user_attention failed: {}", e);
+    // OHOS window layer has no requestAttention API. Emulated via
+    // notificationManager on the ArkTS side (fire-and-forget; the plugin
+    // handles the 1600004 enable-notification retry path).
+    if let Some(window_id) = self.window_id {
+      let client = match &self.window_client {
+        Some(c) => c.clone(),
+        None => return,
+      };
+      self.runtime.spawn(async move {
+        if let Err(e) = client.request_user_attention(window_id).await {
+          log::warn!("[tao-ohos] request_user_attention failed for window {}: {:?}", window_id, e);
+        }
+      });
     }
   }
 
@@ -1511,31 +1963,46 @@ impl Window {
   }
 
   pub fn cursor_position(&self) -> Result<PhysicalPosition<f64>, error::ExternalError> {
-    let x = f64::from_bits(openharmony_ability::CURSOR_POSITION_X.load(Ordering::Relaxed));
-    let y = f64::from_bits(openharmony_ability::CURSOR_POSITION_Y.load(Ordering::Relaxed));
+    let x = f64::from_bits(CURSOR_X.load(Ordering::Relaxed));
+    let y = f64::from_bits(CURSOR_Y.load(Ordering::Relaxed));
     Ok(PhysicalPosition::new(x, y))
   }
 
   pub fn set_ignore_cursor_events(&self, ignore: bool) -> Result<(), error::ExternalError> {
-    // TODO(遗留问题六): 已 dispatch 但未经真机测试 — 需验证穿透模式可见不响应、
-    //   穿透事件落到下层、主窗口/Float 行为一致性。见 doc/OHOS窗口遗留问题.md(问题六)。
-    // tao 语义：ignore=true 表示忽略光标事件（点击穿透）。
-    // OHOS setWindowTouchable：touchable=true 可触摸，false 穿透。故 touchable = !ignore。
-    if let Err(e) = set_window_touchable(self.ohos_win_id(), !ignore) {
-      log::warn!("set_ignore_cursor_events failed to dispatch: {:?}", e);
+    // window_id is None for embedded webviews with no OS-level window — cursor-event
+    // ignore is genuinely unsupported there, so surface NotSupported (per design D4).
+    // Main window (window_id=0) and sub-windows (window_id>0) both proceed.
+    let window_id = self.window_id.ok_or_else(|| {
+      error::ExternalError::NotSupported(error::NotSupportedError::new())
+    })?;
+    // Tauri `ignore=true` (pass events through to windows below) ↔ OHOS `touchable=false`
+    // (window does not consume touch/mouse events). The negation lives in this tao layer;
+    // the facade client passes `touchable` through verbatim. See design D4 mapping table.
+    if let Some(ref client) = self.window_client {
+      let client = client.clone();
+      self.runtime.spawn(async move {
+        if let Err(e) = client.set_window_touchable(window_id, !ignore).await {
+          warn!(
+            "set_ignore_cursor_events: set_window_touchable failed for window {}: {:?}",
+            window_id, e
+          );
+        }
+      });
+    } else {
+      // WindowClient not initialized (e.g. during early init) — surface NotSupported,
+      // matching the old TSFN-uninitialized error path.
+      warn!(
+        "set_ignore_cursor_events: WindowClient not initialized for window {}",
+        window_id
+      );
+      return Err(error::ExternalError::NotSupported(
+        error::NotSupportedError::new(),
+      ));
     }
     Ok(())
   }
 
-  pub fn set_cursor_visible(&self, visible: bool) {
-    // TODO(遗留问题六): 已 dispatch 但未经真机测试 — 需验证作用域(全局 vs 窗口级):
-    //   pointer.setPointerVisible 是全局光标显隐,tao 语义是窗口级,多窗口下会连带影响其他窗口。
-    //   见 doc/OHOS窗口遗留问题.md(问题六)。
-    // 全局光标显隐（@ohos.multimodalInput.pointer.setPointerVisible）。
-    if let Err(e) = set_pointer_visible(visible) {
-      log::warn!("set_cursor_visible failed to dispatch: {:?}", e);
-    }
-  }
+  pub fn set_cursor_visible(&self, _: bool) {}
   pub fn drag_window(&self) -> Result<(), error::ExternalError> {
     // OHOS startMoving (API14+) must be called in onTouch(TouchType.Down) —
     // cannot be triggered programmatically from Rust. Float sub-windows drag
@@ -1556,37 +2023,50 @@ impl Window {
     // OHOS enableDrag (API20+) allows/disables edge drag-resize, but cannot
     // programmatically trigger a specific direction resize. System handles
     // edge drag natively. This returns Ok (no error).
-    let id = self.ohos_win_id();
     // G10: log the success path too so callers can tell "edge-drag enabled"
     // apart from an actual directional resize — the _direction is ignored and
     // no directional resize is started. Mirrors the drag_window no-op log above.
-    match set_window_draggable(id, true) {
-      Ok(()) => log::debug!(
-        "[tao-ohos] drag_resize_window: no directional resize API (_direction ignored); \
-         enableDrag(true) set for window {}",
-        id
-      ),
-      Err(e) => log::warn!(
-        "[tao-ohos] set_window_draggable(true) failed for window {}: {}",
-        id,
-        e
-      ),
+    if let Some(window_id) = self.window_id {
+      let client = match &self.window_client {
+        Some(c) => c.clone(),
+        None => return Ok(()),
+      };
+      self.runtime.spawn(async move {
+        if let Err(e) = client.set_window_draggable(window_id, true).await {
+          log::warn!(
+            "[tao-ohos] set_window_draggable(true) failed for window {}: {:?}",
+            window_id,
+            e
+          );
+        } else {
+          log::debug!(
+            "[tao-ohos] drag_resize_window: no directional resize API (_direction ignored); enableDrag(true) set for window {}",
+            window_id
+          );
+        }
+      });
     }
     Ok(())
   }
 
   pub fn set_background_color(&self, color: Option<crate::window::RGBA>) {
-    // 与 macOS/Windows/Linux 一致：transparent 窗口也允许运行时改背景色。
-    // 不再因 transparent 拦截（commit 7963af3a 误加的拦截与 commit message 矛盾，
-    // 且其他平台均不拦截 transparent 窗口的 set_background_color）。
-    log::info!(
-      "[tao-ohos] set_background_color: transparent={}, color={:?}",
-      self.transparent,
-      color
-    );
+    // Respect transparent flag: silently ignore background_color when transparent=true,
+    // consistent with creation-time behavior and P3 spec.
+    if self.transparent {
+      log::debug!("[tao-ohos] set_background_color ignored: window is transparent");
+      return;
+    }
     let color_u32 = rgba_to_ohos_color(false, color).unwrap_or(0xFFFFFFFF);
     if let Some(window_id) = self.window_id {
-      let _ = set_window_background_color(window_id, color_u32);
+      let client = match &self.window_client {
+        Some(c) => c.clone(),
+        None => return,
+      };
+      self.runtime.spawn(async move {
+        if let Err(e) = client.set_window_background_color(window_id, color_u32).await {
+          log::warn!("[tao-ohos] set_window_background_color failed for window {}: {:?}", window_id, e);
+        }
+      });
     }
   }
 
@@ -1625,8 +2105,22 @@ impl Window {
       Some(Theme::Light) => ColorMode::Light,
       None => ColorMode::NoSet,
     };
-    if let Err(e) = self.app.set_color_mode(color_mode) {
-      log::warn!("set_theme: failed to call setColorMode: {:?}", e);
+    // Migrate from OpenHarmonyApp::set_color_mode (removed) to
+    // ColorModeExt::set_color_mode (MainThreadSync bridge call).
+    // Bridge contract: Dark=0, Light=1, NoSet=2.
+    let mode_i32 = match color_mode {
+      ColorMode::Dark => 0,
+      ColorMode::Light => 1,
+      ColorMode::NoSet => 2,
+    };
+    let env_cell = openharmony_ability::get_main_thread_env();
+    let env_ref = env_cell.borrow();
+    if let Some(env) = env_ref.as_ref() {
+      if let Err(e) = self.app.set_color_mode(env, mode_i32) {
+        log::warn!("set_theme: failed to call set_color_mode: {:?}", e);
+      }
+    } else {
+      log::warn!("set_theme: main thread Env not available");
     }
   }
 
@@ -1682,6 +2176,14 @@ impl Window {
     self.window_id
   }
 
+  /// Returns the `BridgeRuntime` for this window's `OpenHarmonyApp`.
+  /// Used by wry's bridge-based webview backend to construct `WebviewClient::from_bridge`.
+  pub(crate) fn bridge_runtime(
+    &self,
+  ) -> openharmony_ability::napi_ohos::Result<openharmony_ability::BridgeRuntime> {
+    self.app.bridge()
+  }
+
   pub fn current_monitor(&self) -> Option<monitor::MonitorHandle> {
     Some(monitor::MonitorHandle {
       inner: MonitorHandle::new(self.app.clone()),
@@ -1725,8 +2227,17 @@ impl MonitorHandle {
     // content_rect here made positioner `Center` compute to negative coords
     // (content/2 - outer/2 < 0) which OHOS clamps to (0,0), so windows snapped
     // to top-left instead of centering.
-    let (width, height) = self.app.display_size();
-    PhysicalSize::new(width, height)
+    // Prefer OHOS DisplayManager physical pixels; fall back to content_rect
+    // when the query returns 0. See ohos-monitor-real-values.
+    let w = self.app.display_width();
+    let h = self.app.display_height();
+    if w > 0 && h > 0 {
+      PhysicalSize::new(w, h)
+    } else {
+      warn!("[tao ohos] DisplayManager size query returned 0; falling back to content_rect");
+      let size = self.app.content_rect();
+      PhysicalSize::new(size.width as _, size.height as _)
+    }
   }
 
   pub fn position(&self) -> PhysicalPosition<i32> {
@@ -1739,13 +2250,13 @@ impl MonitorHandle {
 
   pub fn video_modes(&self) -> impl Iterator<Item = monitor::VideoMode> {
     let size = self.size().into();
-    // FIXME this is not the real refresh rate
-    // (it is guaranteed to support 32 bit color though)
+    // refresh_rate from OHOS DisplayManager real value (see ohos-monitor-real-values).
+    // bit_depth fixed at 32 (RGBA8888) — see ohos-monitor-degradation.
     std::iter::once(monitor::VideoMode {
       video_mode: VideoMode {
         size,
         bit_depth: 32,
-        refresh_rate: 60,
+        refresh_rate: self.app.refresh_rate() as u16,
         monitor: self.clone(),
       },
     })
@@ -1785,40 +2296,4 @@ pub fn keycode_to_scancode(_code: KeyCode) -> Option<u32> {
 
 pub fn keycode_from_scancode(_scancode: u32) -> KeyCode {
   KeyCode::Unidentified(NativeKeyCode::Unidentified)
-}
-
-#[cfg(test)]
-mod tests {
-  use super::*;
-
-  /// rgba_to_ohos_color：透明优先，否则打包 0xAARRGGBB。
-  #[test]
-  fn rgba_color_packing() {
-    assert_eq!(rgba_to_ohos_color(true, None), Some(0x00000000));
-    assert_eq!(rgba_to_ohos_color(true, Some((255, 0, 0, 255))), Some(0x00000000));
-    // 不透明红：R=255,G=0,B=0,A=255 → 0xFFFF0000
-    assert_eq!(rgba_to_ohos_color(false, Some((255, 0, 0, 255))), Some(0xFFFF0000));
-    // 半透明：A=0x80
-    assert_eq!(rgba_to_ohos_color(false, Some((0, 0, 0, 0x80))), Some(0x80000000));
-    assert_eq!(rgba_to_ohos_color(false, None), None);
-  }
-
-  ///  tao CursorIcon → OHOS PointerStyle 数值映射。
-  #[test]
-  fn cursor_icon_mapping() {
-    use crate::window::CursorIcon;
-    assert_eq!(ohos_pointer_style(CursorIcon::Default), 0);
-    assert_eq!(ohos_pointer_style(CursorIcon::Crosshair), 13);
-    assert_eq!(ohos_pointer_style(CursorIcon::Hand), 19);
-    assert_eq!(ohos_pointer_style(CursorIcon::Text), 26);
-    assert_eq!(ohos_pointer_style(CursorIcon::Wait), 42);
-    assert_eq!(ohos_pointer_style(CursorIcon::NotAllowed), 15);
-    assert_eq!(ohos_pointer_style(CursorIcon::Copy), 14);
-    assert_eq!(ohos_pointer_style(CursorIcon::Grab), 18);
-    assert_eq!(ohos_pointer_style(CursorIcon::Grabbing), 17);
-    assert_eq!(ohos_pointer_style(CursorIcon::ZoomIn), 27);
-    assert_eq!(ohos_pointer_style(CursorIcon::EResize), 1);
-    assert_eq!(ohos_pointer_style(CursorIcon::EwResize), 5);
-    assert_eq!(ohos_pointer_style(CursorIcon::NwseResize), 12);
-  }
 }

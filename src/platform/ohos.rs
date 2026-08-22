@@ -30,6 +30,10 @@ pub trait WindowExtOpenHarmony {
   /// Returns the OS-level window ID, used to distinguish main (0) vs sub-windows.
   fn window_id(&self) -> Option<i64>;
 
+  /// Returns the `BridgeRuntime` for constructing bridge-based facade clients
+  /// (e.g. wry's `WebviewClient::from_bridge`).
+  fn bridge_runtime(&self) -> openharmony_ability::BridgeRuntime;
+
   /// 回灌系统窗口状态到 tao 镜像位(问题五 5.3)。
   ///
   /// `status` 是裸 OHOS `WindowStatusType` 值(透传自 ArkTS `windowStatusChange`)。
@@ -49,6 +53,13 @@ impl WindowExtOpenHarmony for Window {
 
   fn window_id(&self) -> Option<i64> {
     self.window.window_id()
+  }
+
+  fn bridge_runtime(&self) -> openharmony_ability::BridgeRuntime {
+    self
+      .window
+      .bridge_runtime()
+      .expect("BridgeRuntime not available — EventLoop not initialized")
   }
 
   fn apply_window_status(&self, status: i32) {
@@ -133,15 +144,8 @@ impl<T> EventLoopBuilderExtOpenHarmony for EventLoopBuilder<T> {
 /// ```
 pub mod ability {
   #[doc(no_inline)]
-  pub use openharmony_ability::*;
+  pub use openharmony_ability::{OpenHarmonyApp, drain_pending_window_closes};
 
   #[doc(no_inline)]
   pub use openharmony_ability_derive::*;
-
-  #[doc(hidden)]
-  pub struct Rect;
-  #[doc(hidden)]
-  pub struct ConfigurationRef;
-  #[doc(hidden)]
-  pub struct OpenHarmonyApp;
 }
