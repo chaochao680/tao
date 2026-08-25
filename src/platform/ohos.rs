@@ -29,6 +29,13 @@ pub trait WindowExtOpenHarmony {
 
   /// Returns the OS-level window ID, used to distinguish main (0) vs sub-windows.
   fn window_id(&self) -> Option<i64>;
+
+  /// 回灌系统窗口状态到 tao 镜像位(问题五 5.3)。
+  ///
+  /// `status` 是裸 OHOS `WindowStatusType` 值(透传自 ArkTS `windowStatusChange`)。
+  /// 由 tauri-runtime-wry 的 OHOS drain 块在路由到本窗口后调用,更新
+  /// `visible`/`fullscreen` 镜像位以反映系统真值。
+  fn apply_window_status(&self, status: i32);
 }
 
 impl WindowExtOpenHarmony for Window {
@@ -42,6 +49,10 @@ impl WindowExtOpenHarmony for Window {
 
   fn window_id(&self) -> Option<i64> {
     self.window.window_id()
+  }
+
+  fn apply_window_status(&self, status: i32) {
+    self.window.apply_window_status(status);
   }
 }
 
