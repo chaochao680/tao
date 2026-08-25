@@ -191,11 +191,15 @@ impl<T: 'static> EventLoop<T> {
   }
 
   // TODO: For input event, we need some real examples to test it
+  // Input events originate from the *main* window's XComponent (Float sub-windows do
+  // not own an XComponent / render surface). All input dispatch therefore uses
+  // window_id = 0 (main window). Phase 3 (design.md D6) only routes per-window for
+  // WindowResize / ContentRectChange; input remains main-window-scoped.
   fn handle_input_event(event_loop_cell: &Arc<RefCell<Option<Box<dyn FnMut(event::Event<T>) + 'static>>>>, event: &InputEvent) {
     #[allow(unreachable_patterns)]
     match event {
       InputEvent::TouchEvent(motion_event) => {
-        let window_id = window::WindowId(WindowId);
+        let window_id = window::WindowId(WindowId(0));
         let device_id = event::DeviceId(DeviceId(motion_event.device_id as _));
         let action = motion_event.event_type;
 
@@ -266,7 +270,7 @@ impl<T: 'static> EventLoop<T> {
             let logical_key = to_logical(keycode);
 
             let event = event::Event::WindowEvent {
-              window_id: window::WindowId(WindowId),
+              window_id: window::WindowId(WindowId(0)),
               event: event::WindowEvent::KeyboardInput {
                 device_id: event::DeviceId(DeviceId(key.device_id as _)),
                 event: event::KeyEvent {
@@ -291,7 +295,7 @@ impl<T: 'static> EventLoop<T> {
         ImeEvent::TextInputEvent(s) => {
           if let Some(ref mut h) = *event_loop_cell.borrow_mut() {
             h(event::Event::WindowEvent {
-              window_id: window::WindowId(WindowId),
+              window_id: window::WindowId(WindowId(0)),
               event: event::WindowEvent::ReceivedImeText(s.text.clone()),
             })
           }
@@ -301,7 +305,7 @@ impl<T: 'static> EventLoop<T> {
             // Mock keyboard input event
             let _ = [ElementState::Pressed, ElementState::Released].map(|state| {
               h(event::Event::WindowEvent {
-                window_id: window::WindowId(WindowId),
+                window_id: window::WindowId(WindowId(0)),
                 event: event::WindowEvent::KeyboardInput {
                   device_id: event::DeviceId(DeviceId(0)),
                   event: event::KeyEvent {
@@ -325,7 +329,7 @@ impl<T: 'static> EventLoop<T> {
             // Mock keyboard input event
             let _ = [ElementState::Pressed, ElementState::Released].map(|state| {
               h(event::Event::WindowEvent {
-                window_id: window::WindowId(WindowId),
+                window_id: window::WindowId(WindowId(0)),
                 event: event::WindowEvent::KeyboardInput {
                   device_id: event::DeviceId(DeviceId(0)),
                   event: event::KeyEvent {
@@ -349,7 +353,7 @@ impl<T: 'static> EventLoop<T> {
               // Mock keyboard input event that make sure egui can receive the event and trigger onblur event
               let _ = [ElementState::Pressed, ElementState::Released].map(|state| {
                 h(event::Event::WindowEvent {
-                  window_id: window::WindowId(WindowId),
+                  window_id: window::WindowId(WindowId(0)),
                   event: event::WindowEvent::KeyboardInput {
                     device_id: event::DeviceId(DeviceId(0)),
                     event: event::KeyEvent {
@@ -380,7 +384,7 @@ impl<T: 'static> EventLoop<T> {
 
   /// Handle mouse events from the OHOS NDK, converting them to tao WindowEvents.
   fn handle_mouse_event(event_loop_cell: &Arc<RefCell<Option<Box<dyn FnMut(event::Event<T>) + 'static>>>>, mouse_event: &MouseEventData) {
-    let window_id = window::WindowId(WindowId);
+    let window_id = window::WindowId(WindowId(0));
     // Use device_id 0 for mouse, consistent across events.
     let device_id = event::DeviceId(DeviceId(0));
 
@@ -457,7 +461,7 @@ impl<T: 'static> EventLoop<T> {
 
   /// Handle axis (scroll wheel) events from the OHOS ArkUI runtime.
   fn handle_axis_event(event_loop_cell: &Arc<RefCell<Option<Box<dyn FnMut(event::Event<T>) + 'static>>>>, axis_event: &AxisEventData) {
-    let window_id = window::WindowId(WindowId);
+    let window_id = window::WindowId(WindowId(0));
     let device_id = event::DeviceId(DeviceId(0));
     let is_touchpad = axis_event.source_type == InputSourceType::Touchpad;
 
@@ -569,10 +573,13 @@ impl<T: 'static> EventLoop<T> {
             h(event::Event::Suspended);
           }
         }
-        MainEvent::WindowResize(size) => {
+        MainEvent::WindowResize { window_id, size } => {
+          // Phase 3 (design.md D6): route by the originating window's id instead of
+          // the ZST constant. window_id comes from the ArkTS-wrapped options
+          // (lifecycle.rs window_resize closure / xcomponent.rs on_surface_changed).
           let size = PhysicalSize::new(size.width as _, size.height as _);
           let event = event::Event::WindowEvent {
-            window_id: window::WindowId(WindowId),
+            window_id: window::WindowId(WindowId(window_id)),
             event: event::WindowEvent::Resized(size),
           };
 
@@ -581,7 +588,10 @@ impl<T: 'static> EventLoop<T> {
           }
         }
         MainEvent::WindowRedraw { .. } => {
-          let event = event::Event::RedrawRequested(window::WindowId(WindowId));
+          // RedrawRequested is driven by the XComponent frame callback, which is
+          // the *main* window's render surface only (Float sub-windows do not own
+          // an XComponent). Keep window_id = 0 (main window).
+          let event = event::Event::RedrawRequested(window::WindowId(WindowId(0)));
 
           if let Some(ref mut h) = *event_loop_cell.borrow_mut() {
             h(event);
@@ -590,9 +600,11 @@ impl<T: 'static> EventLoop<T> {
         MainEvent::ContentRectChange(content_rect) => {
           // Propagate as Resized so tauri's resize handler fires and calls
           // webview.set_bounds() with the new window dimensions.
+          // Phase 3 (design.md D6): route by content_rect.window_id (populated by the
+          // window_rect_change lifecycle closure from the ArkTS-wrapped windowId).
           let size = PhysicalSize::new(content_rect.rect.width as _, content_rect.rect.height as _);
           let event = event::Event::WindowEvent {
-            window_id: window::WindowId(WindowId),
+            window_id: window::WindowId(WindowId(content_rect.window_id)),
             event: event::WindowEvent::Resized(size),
           };
 
@@ -601,31 +613,37 @@ impl<T: 'static> EventLoop<T> {
           }
         }
         MainEvent::GainedFocus => {
+          // Focus is an app-level UIAbility stage event (StageEventType::ACTIVE),
+          // not per-Float-sub-window. Keep window_id = 0 (main window).
           HAS_FOCUS.store(true, Ordering::Relaxed);
 
           if let Some(ref mut h) = *event_loop_cell.borrow_mut() {
             h(event::Event::WindowEvent {
-              window_id: window::WindowId(WindowId),
+              window_id: window::WindowId(WindowId(0)),
               event: event::WindowEvent::Focused(true),
             });
           }
         }
         MainEvent::LostFocus => {
+          // Focus is an app-level UIAbility stage event (StageEventType::INACTIVE).
+          // Keep window_id = 0 (main window).
           HAS_FOCUS.store(false, Ordering::Relaxed);
 
           if let Some(ref mut h) = *event_loop_cell.borrow_mut() {
             h(event::Event::WindowEvent {
-              window_id: window::WindowId(WindowId),
+              window_id: window::WindowId(WindowId(0)),
               event: event::WindowEvent::Focused(false),
             });
           }
         }
         MainEvent::ConfigChanged { .. } => {
+          // Configuration changes are app-level (EnvironmentCallback), not tied to a
+          // specific window. Keep window_id = 0 (main window).
           let size = app.content_rect();
           let scale = app.scale();
           let mut size = PhysicalSize::new(size.width as _, size.height as _);
           let event = event::Event::WindowEvent {
-            window_id: window::WindowId(WindowId),
+            window_id: window::WindowId(WindowId(0)),
             event: event::WindowEvent::ScaleFactorChanged {
               new_inner_size: &mut size,
               scale_factor: scale as _,
@@ -671,24 +689,16 @@ impl<T: 'static> EventLoop<T> {
           // drain_pending_window_closes()). UIAbility is a singleton (enforced by the
           // UIABILITY_CREATED guard in Window::new), so at most one main window stage
           // exists; this path dispatches CloseRequested + Destroyed for it.
-          //
-          // Risk (ZST WindowId): WindowId is a ZST — every OHOS window hashes to the
-          // same key (0), so tauri-runtime-wry's window_id_map.get(&ZST) returns the
-          // *last-inserted* window, not necessarily the main window. If a Float
-          // sub-window is still registered when WindowDestroy fires, these events
-          // route to that Float window instead of the main window. This is acceptable
-          // because WindowDestroy fires during UIAbility teardown (the app is exiting),
-          // and tauri-runtime-wry's own close-drain is the authoritative per-window
-          // channel. Tracked as a known issue in tauri-runtime-wry (see its TODO).
+          // Keep window_id = 0 (main window).
           if let Some(ref mut h) = *event_loop_cell.borrow_mut() {
             let e = event::Event::WindowEvent {
-              window_id: window::WindowId(WindowId),
+              window_id: window::WindowId(WindowId(0)),
               event: event::WindowEvent::CloseRequested,
             };
             h(e);
             // Also dispatch Destroyed so tauri-runtime-wry can clean up the window.
             let destroyed = event::Event::WindowEvent {
-              window_id: window::WindowId(WindowId),
+              window_id: window::WindowId(WindowId(0)),
               event: event::WindowEvent::Destroyed,
             };
             h(destroyed);
@@ -916,24 +926,31 @@ impl<T: 'static> EventLoopWindowTarget<T> {
   }
 }
 
+// Phase 3 (design.md D6): WindowId was a ZST — every OHOS window hashed to the
+// same key (0), so tauri-runtime-wry's window_id_map.get(&ZST) always returned the
+// last-inserted window (typically the main window). Carrying the OHOS windowId
+// (0 = main, >0 = Float sub-window) as the inner value makes per-window event
+// routing work: distinct windows hash to distinct keys. This type lives entirely
+// inside `#[cfg(target_env = "ohos")]` (platform_impl/mod.rs:29), so other
+// platforms are unaffected (铁律2).
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub(crate) struct WindowId;
+pub(crate) struct WindowId(i64);
 
 impl WindowId {
   pub const fn dummy() -> Self {
-    WindowId
+    WindowId(0)
   }
 }
 
 impl From<WindowId> for u64 {
-  fn from(_: WindowId) -> Self {
-    0
+  fn from(id: WindowId) -> Self {
+    id.0 as u64
   }
 }
 
 impl From<u64> for WindowId {
-  fn from(_: u64) -> Self {
-    Self
+  fn from(id: u64) -> Self {
+    WindowId(id as i64)
   }
 }
 
@@ -1271,7 +1288,10 @@ impl Window {
   }
 
   pub fn id(&self) -> WindowId {
-    WindowId
+    // Phase 3 (design.md D6): return this window's own OHOS windowId instead of
+    // the ZST constant, so tauri-runtime-wry's window_id_map routes events to the
+    // correct WindowWrapper. Main window → WindowId(0), Float sub-window → WindowId(N).
+    WindowId(self.window_id.unwrap_or(0))
   }
 
   pub fn scale_factor(&self) -> f64 {
@@ -1286,7 +1306,9 @@ impl Window {
 
   pub fn inner_position(&self) -> Result<PhysicalPosition<i32>, error::NotSupportedError> {
     let content = self.app.content_rect();
-    let window = self.app.window_rect();
+    // Phase 2 (design.md D5): read this window's own rect by window_id instead of the
+    // shared single field, so sub-windows don't read the main window's rect.
+    let window = self.app.window_rect_for(self.window_id.unwrap_or(0));
     // inner_position = content area position on screen
     // = window position + system title-bar offset + content offset within container.
     // content_rect.left/top is XComponent offset relative to its parent container,
@@ -1319,7 +1341,7 @@ impl Window {
     // The Web component uses .width("100%") (natural layout), so it does not
     // depend on inner_size for sizing — this change only affects window-state
     // save/restore and bounds rate calculations (unused for sizing with "100%").
-    let rect = self.app.window_rect();
+    let rect = self.app.window_rect_for(self.window_id.unwrap_or(0));
     PhysicalSize::new(rect.width as _, rect.height as _)
   }
 
@@ -1377,7 +1399,7 @@ impl Window {
   pub fn set_inner_size_constraints(&self, _: WindowSizeConstraints) {}
 
   pub fn outer_position(&self) -> Result<PhysicalPosition<i32>, error::NotSupportedError> {
-    let rect = self.app.window_rect();
+    let rect = self.app.window_rect_for(self.window_id.unwrap_or(0));
     Ok(PhysicalPosition::new(rect.left, rect.top))
   }
 
@@ -1399,7 +1421,7 @@ impl Window {
   }
 
   pub fn outer_size(&self) -> PhysicalSize<u32> {
-    let window = self.app.window_rect();
+    let window = self.app.window_rect_for(self.window_id.unwrap_or(0));
     // window_rect is set by ArkTS callback, may be (0,0,0,0) initially
     // fallback to content_rect if not yet initialized
     if window.width > 0 && window.height > 0 {
