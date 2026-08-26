@@ -144,7 +144,7 @@ impl<T> EventLoopBuilderExtOpenHarmony for EventLoopBuilder<T> {
 /// ```
 pub mod ability {
   #[doc(no_inline)]
-  pub use openharmony_ability::{OpenHarmonyApp, drain_pending_window_closes};
+  pub use openharmony_ability::{OpenHarmonyApp, drain_pending_window_closes, drain_pending_window_status};
 
   #[doc(no_inline)]
   pub use openharmony_ability_derive::*;
