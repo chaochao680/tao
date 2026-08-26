@@ -1,9 +1,7 @@
 use std::cell::{Cell, RefCell};
 use std::collections::{HashSet, VecDeque};
-use std::ffi::c_void;
 use std::hash::Hash;
 use std::marker::PhantomData;
-use std::ptr::NonNull;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::sync::Arc;
@@ -90,8 +88,8 @@ impl BridgeExecutor {
     }
 }
 
-/// Tracks currently pressed keys for repeat detection.
-/// When a Down event arrives for a key already in this set, it's a repeat.
+// Tracks currently pressed keys for repeat detection.
+// When a Down event arrives for a key already in this set, it's a repeat.
 thread_local! {
     static PRESSED_KEYS: RefCell<HashSet<i32>> = RefCell::new(HashSet::new());
 }
@@ -128,13 +126,11 @@ fn ohos_mouse_button_to_tao(button: OhosMouseButton) -> Option<event::MouseButto
     OhosMouseButton::BackButton => Some(event::MouseButton::Other(4)),
     OhosMouseButton::ForwardButton => Some(event::MouseButton::Other(5)),
     OhosMouseButton::NoneButton => None,
-    _ => None,
   }
 }
 
 pub struct EventLoop<T: 'static> {
   pub(crate) openharmony_app: OpenHarmonyApp,
-  bridge_executor: BridgeExecutor,
   window_target: Arc<event_loop::EventLoopWindowTarget<T>>,
   _cause: StartCause,
   user_events_sender: mpsc::Sender<T>,
@@ -168,7 +164,6 @@ impl<T: 'static> EventLoop<T> {
 
     Self {
       openharmony_app: openharmony_app.clone(),
-      bridge_executor: bridge_executor.clone(),
       window_target: Arc::new(event_loop::EventLoopWindowTarget {
         p: EventLoopWindowTarget {
           app: openharmony_app.clone(),
@@ -1043,6 +1038,11 @@ pub(crate) struct Window {
   max_inner_height: AtomicU32,
 }
 
+// Upstream PR#20 window-type constants (ArkTS WindowType). Only TypeFloat is
+// constructed today — the UIAbility main window needs no window_type, and the
+// multi-UIAbility (TypeMain) path is not ported — but the full mapping is kept
+// for parity with upstream.
+#[allow(dead_code)]
 enum OHOSWindowType {
   TypeApp = 0,
   TypeSystemAlert = 1,
@@ -1335,14 +1335,32 @@ impl Window {
   }
 
   pub fn inner_size(&self) -> PhysicalSize<u32> {
-    // On OHOS desktop, win.resize(w, h) sets the OUTER size (including title bar).
-    // Return window_rect (outer) so save→resize cycles are idempotent:
-    // save inner_size (=outer) → restore via resize(outer) → outer unchanged.
-    // The Web component uses .width("100%") (natural layout), so it does not
-    // depend on inner_size for sizing — this change only affects window-state
-    // save/restore and bounds rate calculations (unused for sizing with "100%").
+    // D2 hybrid (design.md): OHOS win.resize() sets the OUTER size (including
+    // title bar). inner_size must mirror set_inner_size's compensation so
+    // save→restore cycles are idempotent:
+    //   save inner_size (= outer − decor) → restore resize(inner + decor) = outer.
+    // Returning the raw outer rect here (the pre-D2 behavior) made every
+    // window-state save→restore round grow the window by one title bar.
+    //
+    // Float sub-windows have no system title bar (FloatPage ships its own UI
+    // bar): decor = 0, inner == outer. content_rect() mirrors the MAIN window
+    // (G7), which is fine — the system title bar height is uniform app-wide,
+    // and this getter is only meaningful for UIAbility windows regardless.
+    // Web content sizing is unaffected: the Web component uses natural layout
+    // ("100%"), so it never reads inner_size.
     let rect = self.app.window_rect_for(self.window_id.unwrap_or(0));
-    PhysicalSize::new(rect.width as _, rect.height as _)
+    let decor_height = if self.kind == OHOSWindowKind::Float {
+      0
+    } else {
+      let content = self.app.content_rect();
+      if rect.height > content.height && content.height > 0 {
+        (rect.height - content.height) as u32
+      } else {
+        0 // no decorations or content not yet initialized
+      }
+    };
+    let inner_height = (rect.height as u32).saturating_sub(decor_height);
+    PhysicalSize::new(rect.width as _, inner_height)
   }
 
   pub fn set_inner_size(&self, size: Size) {
@@ -1358,17 +1376,18 @@ impl Window {
     // (遗留问题二: inner/outer 语义错位). Width is NOT compensated (title bar only
     // affects height).
     //
-    // G7: app.window_rect()/content_rect() read a single Rect on the shared
-    // OpenHarmonyApp that mirrors the MAIN UIAbility window — not this window.
-    // The compensation is therefore only valid for UIAbility windows: the system
-    // title bar height is uniform app-wide, so the main window's decor_height is a
-    // correct approximation even for subsequent UIAbilities. Float sub-windows have
-    // no system title bar (FloatPage ships its own UI title bar), so applying the
-    // main window's decor_height would shrink/grow them by the wrong inset — skip.
+    // G7: content_rect() reads a single Rect on the shared OpenHarmonyApp that
+    // mirrors the MAIN UIAbility window — not this window. The compensation is
+    // therefore only valid for UIAbility windows: the system title bar height
+    // is uniform app-wide, so the main window's decor_height is a correct
+    // approximation even for subsequent UIAbilities. Float sub-windows have
+    // no system title bar (FloatPage ships its own UI title bar), so applying
+    // the main window's decor_height would shrink/grow them by the wrong
+    // inset — skip. The window rect itself is per-window (window_rect_for).
     let decor_height = if self.kind == OHOSWindowKind::Float {
       0
     } else {
-      let window = self.app.window_rect();
+      let window = self.app.window_rect_for(self.window_id.unwrap_or(0));
       let content = self.app.content_rect();
       if window.height > content.height && content.height > 0 {
         (window.height - content.height) as u32
@@ -1632,7 +1651,7 @@ impl Window {
         None => return,
       };
       self.runtime.spawn(async move {
-        if let Err(e) = client.set_window_decoration_flags(window_id, flags).await {
+        if let Err(e) = client.set_window_decoration_flags(window_id, flags as i32).await {
           log::warn!("[tao-ohos] set_window_decoration_flags failed for window {}: {:?}", window_id, e);
         }
       });
