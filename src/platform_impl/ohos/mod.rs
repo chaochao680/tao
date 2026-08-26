@@ -2319,3 +2319,456 @@ pub fn keycode_to_scancode(_code: KeyCode) -> Option<u32> {
 pub fn keycode_from_scancode(_scancode: u32) -> KeyCode {
   KeyCode::Unidentified(NativeKeyCode::Unidentified)
 }
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  #[test]
+  fn rgba_to_ohos_color_transparent_returns_transparent_black() {
+    assert_eq!(rgba_to_ohos_color(true, None), Some(0x00000000));
+    assert_eq!(rgba_to_ohos_color(true, Some((255, 0, 0, 255))), Some(0x00000000));
+  }
+
+  #[test]
+  fn rgba_to_ohos_color_none_bg_returns_none() {
+    assert_eq!(rgba_to_ohos_color(false, None), None);
+  }
+
+  #[test]
+  fn rgba_to_ohos_color_packs_argb() {
+    assert_eq!(rgba_to_ohos_color(false, Some((255, 128, 0, 200))), Some(0xC8FF8000));
+  }
+
+  #[test]
+  fn rgba_to_ohos_color_opaque_white() {
+    assert_eq!(rgba_to_ohos_color(false, Some((255, 255, 255, 255))), Some(0xFFFFFFFF));
+  }
+
+  #[test]
+  fn rgba_to_ohos_color_zero_alpha() {
+    assert_eq!(rgba_to_ohos_color(false, Some((0, 0, 0, 0))), Some(0x00000000));
+  }
+}
+
+/// Direct unit tests for the input-event handlers. These handlers are pure
+/// transforms (OHOS input data -> tao events via an injected callback cell);
+/// the app autotest never triggers them because no user input occurs, so we
+/// exercise them directly with synthetic events.
+#[cfg(test)]
+mod input_tests {
+  use super::*;
+  use openharmony_ability::TextInputEventData;
+  use openharmony_ability::xcomponent::{
+    EventSource, KeyCode as OhosKeyCode, KeyEventData, TouchEventData, TouchPointData,
+  };
+  use std::sync::Mutex;
+
+  type LoopCell<T> = Arc<RefCell<Option<Box<dyn FnMut(event::Event<T>) + 'static>>>>;
+
+  /// Runs `invoke` with a collector installed in a fresh event-loop cell and
+  /// returns compact descriptors of every event the handler emitted.
+  fn run_collected<T: 'static>(invoke: impl FnOnce(&LoopCell<T>)) -> Vec<String> {
+    let out: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let sink = out.clone();
+    let cell: LoopCell<T> = Arc::new(RefCell::new(Some(Box::new(move |e: event::Event<T>| {
+      let desc = match e {
+        event::Event::WindowEvent { event: we, .. } => match we {
+          event::WindowEvent::CursorMoved { position, .. } => {
+            format!("CursorMoved({},{})", position.x, position.y)
+          }
+          event::WindowEvent::MouseInput { state, button, .. } => {
+            format!("MouseInput({:?},{:?})", state, button)
+          }
+          event::WindowEvent::CursorEntered { .. } => "CursorEntered".to_string(),
+          event::WindowEvent::CursorLeft { .. } => "CursorLeft".to_string(),
+          event::WindowEvent::MouseWheel { delta, modifiers, .. } => format!(
+            "MouseWheel({:?},ctrl={})",
+            delta,
+            modifiers.contains(ModifiersState::CONTROL)
+          ),
+          event::WindowEvent::Touch(t) => format!(
+            "Touch({:?},{},{},id={})",
+            t.phase, t.location.x, t.location.y, t.id
+          ),
+          event::WindowEvent::KeyboardInput { event: ke, .. } => format!(
+            "Key({:?},{:?},loc={:?},repeat={})",
+            ke.state, ke.logical_key, ke.location, ke.repeat
+          ),
+          event::WindowEvent::ReceivedImeText(s) => format!("ImeText({s})"),
+          _ => "Other".to_string(),
+        },
+        _ => "NonWindow".to_string(),
+      };
+      sink.lock().unwrap().push(desc);
+    }))));
+    invoke(&cell);
+    let x = out.lock().unwrap().clone();
+    x
+  }
+
+  fn mouse(action: MouseAction, button: OhosMouseButton) -> MouseEventData {
+    MouseEventData { x: 10.5, y: 20.25, action, button, ..Default::default() }
+  }
+
+  // ─── handle_mouse_event ──────────────────────────────────────────────
+
+  #[test]
+  fn mouse_move_emits_cursor_moved_and_updates_cache() {
+    let evs = run_collected(|cell| {
+      EventLoop::<()>::handle_mouse_event(
+        cell,
+        &mouse(MouseAction::Move, OhosMouseButton::NoneButton),
+      );
+    });
+    assert_eq!(evs, vec!["CursorMoved(10.5,20.25)".to_string()]);
+    assert_eq!(f64::from_bits(CURSOR_X.load(Ordering::Relaxed)), 10.5);
+    assert_eq!(f64::from_bits(CURSOR_Y.load(Ordering::Relaxed)), 20.25);
+  }
+
+  #[test]
+  fn mouse_press_release_left() {
+    let evs = run_collected(|cell| {
+      EventLoop::<()>::handle_mouse_event(
+        cell,
+        &mouse(MouseAction::Press, OhosMouseButton::LeftButton),
+      );
+      EventLoop::<()>::handle_mouse_event(
+        cell,
+        &mouse(MouseAction::Release, OhosMouseButton::LeftButton),
+      );
+    });
+    assert_eq!(
+      evs,
+      vec![
+        "MouseInput(Pressed,Left)".to_string(),
+        "MouseInput(Released,Left)".to_string(),
+      ]
+    );
+  }
+
+  #[test]
+  fn mouse_press_back_button_maps_to_other4() {
+    let evs = run_collected(|cell| {
+      EventLoop::<()>::handle_mouse_event(
+        cell,
+        &mouse(MouseAction::Press, OhosMouseButton::BackButton),
+      );
+      EventLoop::<()>::handle_mouse_event(
+        cell,
+        &mouse(MouseAction::Release, OhosMouseButton::ForwardButton),
+      );
+    });
+    assert_eq!(
+      evs,
+      vec![
+        "MouseInput(Pressed,Other(4))".to_string(),
+        "MouseInput(Released,Other(5))".to_string(),
+      ]
+    );
+  }
+
+  #[test]
+  fn mouse_press_none_button_emits_nothing() {
+    let evs = run_collected(|cell| {
+      EventLoop::<()>::handle_mouse_event(
+        cell,
+        &mouse(MouseAction::Press, OhosMouseButton::NoneButton),
+      );
+    });
+    assert!(evs.is_empty());
+  }
+
+  #[test]
+  fn mouse_hover_enter_leave() {
+    let evs = run_collected(|cell| {
+      EventLoop::<()>::handle_mouse_event(
+        cell,
+        &mouse(MouseAction::HoverEnter, OhosMouseButton::NoneButton),
+      );
+      EventLoop::<()>::handle_mouse_event(
+        cell,
+        &mouse(MouseAction::HoverLeave, OhosMouseButton::NoneButton),
+      );
+    });
+    assert_eq!(
+      evs,
+      vec!["CursorEntered".to_string(), "CursorLeft".to_string()]
+    );
+  }
+
+  #[test]
+  fn mouse_none_action_emits_nothing() {
+    let evs = run_collected(|cell| {
+      EventLoop::<()>::handle_mouse_event(
+        cell,
+        &mouse(MouseAction::None, OhosMouseButton::NoneButton),
+      );
+    });
+    assert!(evs.is_empty());
+  }
+
+  // ─── handle_axis_event ───────────────────────────────────────────────
+
+  #[test]
+  fn axis_mouse_wheel_uses_line_delta() {
+    let evs = run_collected(|cell| {
+      let d = AxisEventData {
+        delta_x: 0.0,
+        delta_y: 3.0,
+        pinch_scale: 0.0,
+        source_type: InputSourceType::Mouse,
+        ..Default::default()
+      };
+      EventLoop::<()>::handle_axis_event(cell, &d);
+    });
+    assert_eq!(
+      evs,
+      vec!["MouseWheel(LineDelta(0.0, 3.0),ctrl=false)".to_string()]
+    );
+  }
+
+  #[test]
+  fn axis_touchpad_uses_pixel_delta() {
+    let evs = run_collected(|cell| {
+      let d = AxisEventData {
+        delta_x: 10.0,
+        delta_y: 20.0,
+        pinch_scale: 0.0,
+        source_type: InputSourceType::Touchpad,
+        ..Default::default()
+      };
+      EventLoop::<()>::handle_axis_event(cell, &d);
+    });
+    assert_eq!(
+      evs,
+      vec!["MouseWheel(PixelDelta(PhysicalPosition { x: 10.0, y: 20.0 }),ctrl=false)".to_string()]
+    );
+  }
+
+  #[test]
+  fn axis_pinch_zoom_in_and_out_emit_ctrl_wheel() {
+    let evs = run_collected(|cell| {
+      let in_ = AxisEventData { pinch_scale: 1.5, ..Default::default() };
+      let out_ = AxisEventData { pinch_scale: 0.5, ..Default::default() };
+      EventLoop::<()>::handle_axis_event(cell, &in_);
+      EventLoop::<()>::handle_axis_event(cell, &out_);
+    });
+    assert_eq!(
+      evs,
+      vec![
+        "MouseWheel(LineDelta(0.0, 1.0),ctrl=true)".to_string(),
+        "MouseWheel(LineDelta(0.0, -1.0),ctrl=true)".to_string(),
+      ]
+    );
+  }
+
+  #[test]
+  fn axis_idle_event_emits_nothing() {
+    let evs = run_collected(|cell| {
+      EventLoop::<()>::handle_axis_event(cell, &AxisEventData::default());
+    });
+    assert!(evs.is_empty());
+  }
+
+  // ─── handle_input_event dispatch ─────────────────────────────────────
+
+  #[test]
+  fn input_event_routes_mouse() {
+    let evs = run_collected(|cell| {
+      EventLoop::<()>::handle_input_event(
+        cell,
+        &InputEvent::MouseEvent(mouse(MouseAction::Move, OhosMouseButton::NoneButton)),
+      );
+    });
+    assert_eq!(evs, vec!["CursorMoved(10.5,20.25)".to_string()]);
+  }
+
+  #[test]
+  fn input_event_routes_axis() {
+    let evs = run_collected(|cell| {
+      let d = AxisEventData {
+        delta_y: 2.0,
+        source_type: InputSourceType::Mouse,
+        ..Default::default()
+      };
+      EventLoop::<()>::handle_input_event(cell, &InputEvent::AxisEvent(d));
+    });
+    assert_eq!(
+      evs,
+      vec!["MouseWheel(LineDelta(0.0, 2.0),ctrl=false)".to_string()]
+    );
+  }
+
+  #[test]
+  fn touch_down_emits_started_per_pointer() {
+    let mut touch = TouchEventData { event_type: TouchEvent::Down, ..Default::default() };
+    touch.touch_points = vec![
+      TouchPointData {
+        id: 7,
+        x: 1.5,
+        y: 2.5,
+        force: 0.5,
+        event_type: TouchEvent::Down,
+        ..Default::default()
+      },
+      TouchPointData {
+        id: 9,
+        x: 3.5,
+        y: 4.5,
+        force: 0.25,
+        event_type: TouchEvent::Down,
+        ..Default::default()
+      },
+    ];
+    let evs = run_collected(|cell| {
+      EventLoop::<()>::handle_input_event(cell, &InputEvent::TouchEvent(touch));
+    });
+    assert_eq!(
+      evs,
+      vec![
+        "Touch(Started,1.5,2.5,id=7)".to_string(),
+        "Touch(Started,3.5,4.5,id=9)".to_string(),
+      ]
+    );
+  }
+
+  #[test]
+  fn touch_move_up_cancel_phases() {
+    for (ty, phase) in [
+      (TouchEvent::Move, "Moved"),
+      (TouchEvent::Up, "Ended"),
+      (TouchEvent::Cancel, "Cancelled"),
+    ] {
+      let mut touch = TouchEventData { event_type: ty, ..Default::default() };
+      touch.touch_points = vec![
+        TouchPointData { id: 1, event_type: ty, ..Default::default() },
+      ];
+      let evs = run_collected(|cell| {
+        EventLoop::<()>::handle_input_event(cell, &InputEvent::TouchEvent(touch.clone()));
+      });
+      assert_eq!(evs, vec![format!("Touch({phase},0,0,id=1)")], "phase {phase}");
+    }
+  }
+
+  #[test]
+  fn touch_unknown_event_type_emits_nothing() {
+    let mut touch = TouchEventData { event_type: TouchEvent::Unknown, ..Default::default() };
+    touch.touch_points = vec![
+      TouchPointData { id: 1, event_type: TouchEvent::Unknown, ..Default::default() },
+    ];
+    let evs = run_collected(|cell| {
+      EventLoop::<()>::handle_input_event(cell, &InputEvent::TouchEvent(touch));
+    });
+    assert!(evs.is_empty());
+  }
+
+  fn key(code: OhosKeyCode, action: Action) -> InputEvent {
+    InputEvent::KeyEvent(KeyEventData {
+      code,
+      action,
+      device_id: 3,
+      source: EventSource::Keyboard,
+      timestamp: 0,
+    })
+  }
+
+  #[test]
+  fn key_down_up_and_autorepeat() {
+    PRESSED_KEYS.with(|k| k.borrow_mut().clear());
+    let evs = run_collected(|cell| {
+      EventLoop::<()>::handle_input_event(cell, &key(OhosKeyCode::A, Action::Down));
+      EventLoop::<()>::handle_input_event(cell, &key(OhosKeyCode::A, Action::Down));
+      EventLoop::<()>::handle_input_event(cell, &key(OhosKeyCode::A, Action::Up));
+    });
+    assert_eq!(evs.len(), 3);
+    assert!(
+      evs[0].starts_with("Key(Pressed,") && evs[0].ends_with(",repeat=false)"),
+      "{}",
+      evs[0]
+    );
+    assert!(evs[1].ends_with(",repeat=true)"), "{}", evs[1]);
+    assert!(evs[2].starts_with("Key(Released,"), "{}", evs[2]);
+    PRESSED_KEYS.with(|k| k.borrow_mut().clear());
+  }
+
+  #[test]
+  fn key_location_for_modifier_pairs() {
+    PRESSED_KEYS.with(|k| k.borrow_mut().clear());
+    let evs = run_collected(|cell| {
+      EventLoop::<()>::handle_input_event(cell, &key(OhosKeyCode::ShiftLeft, Action::Down));
+      EventLoop::<()>::handle_input_event(cell, &key(OhosKeyCode::ShiftRight, Action::Down));
+      EventLoop::<()>::handle_input_event(cell, &key(OhosKeyCode::Numpad5, Action::Down));
+    });
+    assert_eq!(evs.len(), 3);
+    assert!(evs[0].contains("loc=Left"), "{}", evs[0]);
+    assert!(evs[1].contains("loc=Right"), "{}", evs[1]);
+    assert!(evs[2].contains("loc=Numpad"), "{}", evs[2]);
+    PRESSED_KEYS.with(|k| k.borrow_mut().clear());
+  }
+
+  // ─── IME events ──────────────────────────────────────────────────────
+
+  #[test]
+  fn ime_text_input_emits_received_ime_text() {
+    let evs = run_collected(|cell| {
+      EventLoop::<()>::handle_input_event(
+        cell,
+        &InputEvent::ImeEvent(ImeEvent::TextInputEvent(TextInputEventData {
+          text: "hello".to_string(),
+        })),
+      );
+    });
+    assert_eq!(evs, vec!["ImeText(hello)".to_string()]);
+  }
+
+  #[test]
+  fn ime_backspace_and_enter_mock_press_release_pairs() {
+    let evs = run_collected(|cell| {
+      EventLoop::<()>::handle_input_event(
+        cell,
+        &InputEvent::ImeEvent(ImeEvent::BackspaceEvent(1)),
+      );
+      EventLoop::<()>::handle_input_event(
+        cell,
+        &InputEvent::ImeEvent(ImeEvent::EnterEvent(1)),
+      );
+    });
+    assert_eq!(evs.len(), 4);
+    assert!(evs[0].starts_with("Key(Pressed,Backspace"), "{}", evs[0]);
+    assert!(evs[1].starts_with("Key(Released,Backspace"), "{}", evs[1]);
+    assert!(evs[2].starts_with("Key(Pressed,Enter"), "{}", evs[2]);
+    assert!(evs[3].starts_with("Key(Released,Enter"), "{}", evs[3]);
+  }
+
+  #[test]
+  fn ime_status_hide_mocks_enter_show_is_ignored() {
+    let evs = run_collected(|cell| {
+      EventLoop::<()>::handle_input_event(
+        cell,
+        &InputEvent::ImeEvent(ImeEvent::ImeStatusEvent(KeyboardStatus::Hide)),
+      );
+      EventLoop::<()>::handle_input_event(
+        cell,
+        &InputEvent::ImeEvent(ImeEvent::ImeStatusEvent(KeyboardStatus::Show)),
+      );
+    });
+    assert_eq!(evs.len(), 2);
+    assert!(
+      evs.iter().all(|e| e.starts_with("Key(") && e.contains("Enter")),
+      "{evs:?}"
+    );
+  }
+}
+
+// ─── S9 fmt 批：OsError Display（文件尾追加，不移动既有行号） ────────────────────
+#[cfg(test)]
+mod fmt_tests {
+  use super::OsError;
+
+  #[test]
+  fn os_error_display_writes_message() {
+    assert_eq!(format!("{}", OsError), "OpenHarmony OS Error");
+    assert_eq!(format!("{:?}", OsError), "OsError"); // Debug derive
+  }
+}
