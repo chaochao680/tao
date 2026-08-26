@@ -115,7 +115,9 @@ openharmony-ability-plugin-window = { path = "../openharmony-ability/crates/plug
 openharmony-ability-plugin-app-control = { path = "../openharmony-ability/crates/plugin-app-control" }
 # tao is a standalone workspace (members = ["tao-macros"], no [workspace.dependencies]).
 # Cannot use workspace = true; pin directly to match openharmony-ability's tokio version.
-tokio = { version = "1", features = ["rt", "sync"] }
+# "sync" is the decor watcher channel; "time" is its bounded resize-landing recheck
+# (one delayed retry, NOT the removed 15s polling loop).
+tokio = { version = "1", features = ["rt", "sync", "time"] }
 
 [target."cfg(any(target_os = \"ios\", target_os = \"macos\"))".dependencies]
 objc2 = "0.6"

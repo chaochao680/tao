@@ -4,7 +4,7 @@ use std::hash::Hash;
 use std::marker::PhantomData;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use keycodes::{to_location, to_logical};
 use openharmony_ability::window::{create_os_window, WindowCreateParams, set_cursor_grab};
@@ -984,6 +984,169 @@ pub struct PlatformSpecificWindowBuilderAttributes {
   pub window_kind: Option<OHOSWindowKind>,
 }
 
+/// Message to the per-window decor watcher task (see `Window::decor_watch`).
+/// Dispatches, decor-change events and rechecks flow through the SAME
+/// unbounded channel, so the watcher observes them in causal order.
+enum DecorWatchMsg {
+  /// A new set_inner_size dispatch. Replaces (supersedes) any active one.
+  Dispatch {
+    client: openharmony_ability_plugin_window::WindowClient,
+    /// Outer width to set (width is never decor-compensated).
+    w: i64,
+    /// Requested INNER height (physical px) — the correction target.
+    req_h: i64,
+    /// Outer height dispatched (req_h + decor estimate at dispatch time).
+    outer_h: i64,
+    /// Window height BEFORE this dispatch (to detect "resize not landed yet").
+    pre_h: i64,
+    /// Decor estimate used for this dispatch.
+    decor_used: i32,
+  },
+  /// The cached main-window decor changed (app decor_change_callback).
+  Decor(i32),
+  /// Delayed recheck: our own resize had not landed when the Decor event
+  /// arrived (audit P1-B) — re-evaluate with a fresh decor read.
+  Recheck,
+}
+
+/// Registered handle of a window's decor watcher (one per window, created
+/// lazily by the first correctable set_inner_size call).
+struct DecorWatchHandle {
+  tx: tokio::sync::mpsc::UnboundedSender<DecorWatchMsg>,
+  /// Id in openharmony-ability's decor_change_callbacks registry.
+  cb_id: u64,
+}
+
+/// Fallback recheck budget per dispatch: one Recheck every 500ms while our
+/// resize hasn't landed (pathological — normally it lands within tens of ms),
+/// giving up after ~30s so a resize that never lands can't spin forever.
+const ACTIVE_RESIZE_RECHECKS: u32 = 60;
+
+/// The single in-flight resize a decor watcher is tracking.
+struct ActiveResize {
+  client: openharmony_ability_plugin_window::WindowClient,
+  w: i64,
+  req_h: i64,
+  outer_h: i64,
+  pre_h: i64,
+  decor_used: i32,
+  rechecks_left: u32,
+}
+
+/// Evaluate one decor observation (event or recheck) against the active
+/// dispatch. See `run_decor_watch` for the correction/deactivation rules.
+async fn process_decor_observation(
+  active: &mut Option<ActiveResize>,
+  app: &openharmony_ability::OpenHarmonyApp,
+  window_id: i64,
+  tx: &tokio::sync::mpsc::UnboundedSender<DecorWatchMsg>,
+  decor_now: i32,
+) {
+  let Some(a) = active.as_mut() else { return };
+  if decor_now == a.decor_used {
+    return; // same estimate — nothing to correct
+  }
+  if decor_now < a.decor_used {
+    // Downward: runtime menubar hide (146 → 66) or equivalent. The inner
+    // area grows by itself; correcting would shrink the outer frame. (The
+    // content area ends up LARGER than req_h by the decor delta — the
+    // expected effect of hiding the menubar.) Treat as "layout intent
+    // settled" and drop the active dispatch.
+    *active = None;
+    return;
+  }
+  let current = app.window_rect_for(window_id).height as i64;
+  if current == a.pre_h {
+    // Our own resize has not landed yet — schedule a delayed recheck instead
+    // of misreading this as an external change (audit P1-B).
+    let tx_retry = tx.clone();
+    tokio::spawn(async move {
+      tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+      let _ = tx_retry.send(DecorWatchMsg::Recheck);
+    });
+    return;
+  }
+  if current != a.outer_h {
+    // Window moved on without us — don't stomp an external resize.
+    *active = None;
+    return;
+  }
+  let corrected = a.req_h.saturating_add(decor_now as i64);
+  a.pre_h = a.outer_h;
+  a.outer_h = corrected;
+  a.decor_used = decor_now;
+  a.rechecks_left = ACTIVE_RESIZE_RECHECKS;
+  log::info!(
+    "[tao-ohos] set_inner_size self-correct: window {} decor -> {} re-dispatch outer {}x{}",
+    window_id, decor_now, a.w, corrected
+  );
+  if let Err(e) = a.client.resize_window(window_id, a.w, corrected).await {
+    log::warn!("[tao-ohos] resize_window (self-correct) failed for window {}: {:?}", window_id, e);
+    *active = None;
+  }
+}
+
+/// Per-window decor watcher task: consumes Dispatch/Decor/Recheck messages and,
+/// while a dispatch is active and the decor estimate GROWS (startup layout
+/// convergence — observed 70 → 146 on the reference device), re-dispatches the
+/// corrected outer height so the requested INNER height survives.
+///
+/// Event-driven replacement of the former 15s polling loop — no periodic
+/// timer, so arbitrarily slow cold starts (frontend loading for 20-30s) are
+/// still corrected. Deactivation rules (stop correcting the active dispatch):
+/// - downward decor change (menubar hidden at runtime: the content area GROWS
+///   naturally; re-dispatching would wrongly shrink the outer frame);
+/// - the window height was changed by anyone else (user drag / another
+///   resize source) — never stomp an external resize;
+/// - a newer Dispatch (supersession);
+/// - recheck budget exhausted while our resize never landed (pathological).
+async fn run_decor_watch(
+  app: openharmony_ability::OpenHarmonyApp,
+  window_id: i64,
+  tx: tokio::sync::mpsc::UnboundedSender<DecorWatchMsg>,
+  mut rx: tokio::sync::mpsc::UnboundedReceiver<DecorWatchMsg>,
+) {
+  let mut active: Option<ActiveResize> = None;
+  loop {
+    let Some(msg) = rx.recv().await else { break }; // window dropped — exit
+    match msg {
+      DecorWatchMsg::Dispatch { client, w, req_h, outer_h, pre_h, decor_used } => {
+        if let Err(e) = client.resize_window(window_id, w, outer_h).await {
+          log::warn!("[tao-ohos] resize_window failed for window {}: {:?}", window_id, e);
+        }
+        // A no-op resize (target == current height) has nothing to "land":
+        // sentinel pre_h so the not-landed-yet guard never matches and the
+        // first Decor event corrects normally (audit P1-A).
+        let pre_h = if outer_h == pre_h { i64::MIN } else { pre_h };
+        active = Some(ActiveResize {
+          client,
+          w,
+          req_h,
+          outer_h,
+          pre_h,
+          decor_used,
+          rechecks_left: ACTIVE_RESIZE_RECHECKS,
+        });
+      }
+      DecorWatchMsg::Decor(decor_now) => {
+        process_decor_observation(&mut active, &app, window_id, &tx, decor_now).await;
+      }
+      DecorWatchMsg::Recheck => {
+        if active.as_ref().is_some_and(|a| a.rechecks_left == 0) {
+          // Our resize still hasn't landed after the full budget — give up.
+          active = None;
+          continue;
+        }
+        if let Some(a) = active.as_mut() {
+          a.rechecks_left -= 1;
+        }
+        let decor_now = app.decor_height();
+        process_decor_observation(&mut active, &app, window_id, &tx, decor_now).await;
+      }
+    }
+  }
+}
+
 pub(crate) struct Window {
   app: OpenHarmonyApp,
   window_id: Option<i64>,
@@ -996,6 +1159,10 @@ pub(crate) struct Window {
   window_client: Option<openharmony_ability_plugin_window::WindowClient>,
   /// Background runtime handle for spawning async bridge calls.
   runtime: BridgeExecutor,
+  /// Lazily-created per-window decor watcher (see `run_decor_watch`): one
+  /// long-lived task + one decor-change callback per window, driven by events
+  /// instead of a timer. Mutex<Option<..>> because set_inner_size takes &self.
+  decor_watch: Arc<Mutex<Option<DecorWatchHandle>>>,
   /// State mirror for is_maximized() — written by setter intent AND backfilled
   /// by apply_window_status (windowStatusChange events), so it reflects the last
   /// known system truth (the bridge facade has no synchronous system query).
@@ -1237,6 +1404,7 @@ impl Window {
       runtime,
       maximized: AtomicBool::new(false),
       minimized: AtomicBool::new(false),
+      decor_watch: Arc::new(Mutex::new(None)),
       decorations: AtomicBool::new(window_attrs.decorations),
       transparent: window_attrs.transparent,
       visible: AtomicBool::new(true),
@@ -1313,20 +1481,23 @@ impl Window {
     // = window position + system title-bar offset + content offset within container.
     // content_rect.left/top is XComponent offset relative to its parent container,
     // which already sits BELOW the system title bar — the title bar height is not
-    // included. Add decor_height (window_rect − content_rect), mirroring
-    // set_inner_size's compensation (遗留问题二 getter 侧): without this,
-    // innerPosition == outerPosition on decorated windows (observed 2026-08-20:
-    // inner (515,451) == outer (515,451) with a 146px title bar; true content
-    // origin is (515,597)).
+    // included. Add decor_height, mirroring set_inner_size's compensation (遗留问题二
+    // getter 侧): without this, innerPosition == outerPosition on decorated windows
+    // (observed 2026-08-20: inner (515,451) == outer (515,451) with a 146px title
+    // bar; true content origin is (515,597)).
     // Float sub-windows have no system title bar (FloatPage ships its own UI bar):
     // skip, same as set_inner_size. (G7: the mirrored rects track the MAIN window,
     // so this getter is only meaningful for main/UIAbility windows regardless.)
+    //
+    // decor_height reads the CACHED estimate (app.decor_height()), not a live
+    // window_rect − content_rect diff: the WM rect and the XComponent surface rect
+    // update asynchronously, and a read in the gap between them produces garbage
+    // (observed 824/770/292 instead of the real 146). The cache is latched on
+    // surface events only, where both rects are consistent.
     let decor_height = if self.kind == OHOSWindowKind::Float {
       0
-    } else if window.height > content.height && content.height > 0 {
-      window.height - content.height
     } else {
-      0 // no decorations or content not yet initialized
+      self.app.decor_height()
     };
     Ok(PhysicalPosition::new(
       window.left + content.left,
@@ -1348,16 +1519,18 @@ impl Window {
     // and this getter is only meaningful for UIAbility windows regardless.
     // Web content sizing is unaffected: the Web component uses natural layout
     // ("100%"), so it never reads inner_size.
+    //
+    // decor_height reads the CACHED estimate (app.decor_height()), latched on
+    // surface events. The previous live window_rect − content_rect diff raced:
+    // the WM rect updates ~10-40ms before the XComponent surface rect, and an
+    // inner_size() call in that gap computed garbage decor (824/770/292 instead
+    // of 146), corrupting reads that tests then fed back through setSize —
+    // the root cause of the shrinking-main-window bug.
     let rect = self.app.window_rect_for(self.window_id.unwrap_or(0));
     let decor_height = if self.kind == OHOSWindowKind::Float {
       0
     } else {
-      let content = self.app.content_rect();
-      if rect.height > content.height && content.height > 0 {
-        (rect.height - content.height) as u32
-      } else {
-        0 // no decorations or content not yet initialized
-      }
+      self.app.decor_height().max(0) as u32
     };
     let inner_height = (rect.height as u32).saturating_sub(decor_height);
     PhysicalSize::new(rect.width as _, inner_height)
@@ -1371,7 +1544,8 @@ impl Window {
     }
     // Compensate for title bar height: OHOS win.resize() sets the OUTER size
     // (including title bar), but the caller expects INNER size (content area).
-    // decor_height = window_rect.height - content_rect.height (title bar + borders).
+    // decor_height = main-window title bar inset (cached, latched on surface
+    // events — see app.rs latch_decor_height).
     // Without this, save→restore loops shrink the window by one title bar each cycle
     // (遗留问题二: inner/outer 语义错位). Width is NOT compensated (title bar only
     // affects height).
@@ -1384,17 +1558,13 @@ impl Window {
     // no system title bar (FloatPage ships its own UI title bar), so applying
     // the main window's decor_height would shrink/grow them by the wrong
     // inset — skip. The window rect itself is per-window (window_rect_for).
-    let decor_height = if self.kind == OHOSWindowKind::Float {
-      0
-    } else {
-      let window = self.app.window_rect_for(self.window_id.unwrap_or(0));
-      let content = self.app.content_rect();
-      if window.height > content.height && content.height > 0 {
-        (window.height - content.height) as u32
-      } else {
-        0  // no decorations or content not yet initialized
-      }
-    };
+    //
+    // decor_height reads the CACHED estimate (app.decor_height()) — same race
+    // rationale as inner_size: a live window_rect − content_rect diff in the
+    // WM-rect/surface-rect update gap produced garbage decor, which fed back
+    // through resize(inner + garbage) and compounded the shrink.
+    let is_float = self.kind == OHOSWindowKind::Float;
+    let decor_height = if is_float { 0 } else { self.app.decor_height().max(0) as u32 };
     // For LogicalSize, convert via the real scale_factor (a hardcoded 1.0 would
     // halve the window on DPR≠1 displays). The ArkTS side
     // (WindowManager.resizeWindow) does NOT compensate — it calls win.resize(w, h)
@@ -1408,13 +1578,85 @@ impl Window {
       };
       let w = s.width as i64;
       let h = outer_height as i64;
-      self.runtime.spawn(async move {
-        if let Err(e) = client.resize_window(window_id, w, h).await {
-          log::warn!("[tao-ohos] resize_window failed for window {}: {:?}", window_id, e);
+      if is_float {
+        // Float sub-windows: decor is 0 by design (FloatPage ships its own UI
+        // bar) and app.decor_height() mirrors the MAIN window — a watcher fed
+        // by main-window decor events would mis-correct Float windows by the
+        // main window's title-bar inset (observed 1520x1140 → 1520x1286).
+        // Fire-and-forget, no self-correction.
+        self.runtime.spawn(async move {
+          if let Err(e) = client.resize_window(window_id, w, h).await {
+            log::warn!("[tao-ohos] resize_window failed for window {}: {:?}", window_id, e);
+          }
+        });
+        return;
+      }
+      // UIAbility window: route through the per-window decor watcher so a
+      // dispatch that raced a transient decor estimate (notably window-state
+      // restore on startup, where layout converges to the real decor only
+      // after the webview frontend loads) is self-corrected when the cached
+      // decor converges. See run_decor_watch for the correction/deactivation
+      // rules.
+      let pre_h = self.app.window_rect_for(window_id).height as i64;
+      match self.ensure_decor_watch(window_id) {
+        Some(tx) => {
+          let _ = tx.send(DecorWatchMsg::Dispatch {
+            client,
+            w,
+            req_h: s.height as i64,
+            outer_h: h,
+            pre_h,
+            decor_used: decor_height as i32,
+          });
         }
-      });
+        None => {
+          // Watcher unavailable (registration failed) — plain dispatch.
+          self.runtime.spawn(async move {
+            if let Err(e) = client.resize_window(window_id, w, h).await {
+              log::warn!("[tao-ohos] resize_window failed for window {}: {:?}", window_id, e);
+            }
+          });
+        }
+      }
     }
   }
+
+  /// Lazily create this window's decor watcher (task + decor-change callback)
+  /// on the first correctable set_inner_size call, and return its sender.
+  /// Later calls reuse the existing watcher — one task and one callback per
+  /// window for the window's lifetime, so no per-dispatch accumulation.
+  /// Returns None only when callback registration failed (app RwLock
+  /// poisoned — post-panic only); callers degrade to fire-and-forget.
+  fn ensure_decor_watch(
+    &self,
+    window_id: i64,
+  ) -> Option<tokio::sync::mpsc::UnboundedSender<DecorWatchMsg>> {
+    let mut guard = self.decor_watch.lock().expect("decor_watch poisoned");
+    if let Some(handle) = guard.as_ref() {
+      return Some(handle.tx.clone());
+    }
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    // The callback runs under the app's RwLock write lock — it must stay
+    // lock-free. An unbounded-channel send is exactly that (non-blocking).
+    let tx_for_cb = tx.clone();
+    let cb_id = self.app.register_decor_change_callback(Arc::new(move |decor: i32| {
+      let _ = tx_for_cb.send(DecorWatchMsg::Decor(decor));
+      true // keep registered; removed when the window is dropped
+    }));
+    if cb_id == u64::MAX {
+      // Registration failed (poisoned lock): no callback → the watcher would
+      // never observe decor changes. Don't spawn it.
+      return None;
+    }
+    let app = self.app.clone();
+    let tx_for_watch = tx.clone();
+    self.runtime.spawn(async move {
+      run_decor_watch(app, window_id, tx_for_watch, rx).await;
+    });
+    *guard = Some(DecorWatchHandle { tx: tx.clone(), cb_id });
+    Some(tx)
+  }
+
   pub fn set_inner_size_constraints(&self, _: WindowSizeConstraints) {}
 
   pub fn outer_position(&self) -> Result<PhysicalPosition<i32>, error::NotSupportedError> {
@@ -2331,6 +2573,25 @@ impl VideoMode {
     }
   }
 }
+
+impl Drop for Window {
+  /// Deregister the decor-change callback. Dropping the handle's sender AND
+  /// removing the callback closure (which holds the other sender) closes the
+  /// watcher channel from both ends, so `run_decor_watch` exits instead of
+  /// parking forever. Windows that never took the correctable set_inner_size
+  /// path (Float sub-windows) have no watcher — the take() is a no-op.
+  fn drop(&mut self) {
+    if let Some(handle) = self
+      .decor_watch
+      .lock()
+      .expect("decor_watch poisoned")
+      .take()
+    {
+      self.app.remove_decor_change_callback(handle.cb_id);
+    }
+  }
+}
+
 pub fn keycode_to_scancode(_code: KeyCode) -> Option<u32> {
   None
 }
