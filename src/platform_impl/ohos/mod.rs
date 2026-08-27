@@ -2301,7 +2301,24 @@ impl Window {
     Ok(())
   }
 
-  pub fn set_cursor_visible(&self, _: bool) {}
+  pub fn set_cursor_visible(&self, visible: bool) {
+    // TODO(遗留问题六): 已 dispatch 但未经真机测试 — 需验证作用域(全局 vs 窗口级):
+    //   pointer.setPointerVisible 是全局光标显隐,tao 语义是窗口级,多窗口下会连带影响其他窗口。
+    //   见 doc/OHOS窗口遗留问题.md(问题六)。
+    // 全局光标显隐（pointer.setPointerVisible）,经 window bridge facade
+    // fire-and-forget 派发(ArkTS 侧委托 WindowManager.setPointerVisible)。
+    // Restores the dispatch that the bridge facade migration dropped to a
+    // no-op — the ArkTS implementation survived, only the Rust call was lost.
+    let client = match &self.window_client {
+      Some(c) => c.clone(),
+      None => return,
+    };
+    self.runtime.spawn(async move {
+      if let Err(e) = client.set_cursor_visible(visible).await {
+        log::warn!("[tao-ohos] set_cursor_visible failed to dispatch: {:?}", e);
+      }
+    });
+  }
   pub fn drag_window(&self) -> Result<(), error::ExternalError> {
     // OHOS startMoving (API14+) must be called in onTouch(TouchType.Down) —
     // cannot be triggered programmatically from Rust. Float sub-windows drag
