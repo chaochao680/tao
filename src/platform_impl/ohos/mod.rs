@@ -2,7 +2,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::{HashSet, VecDeque};
 use std::hash::Hash;
 use std::marker::PhantomData;
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 
@@ -42,11 +42,11 @@ const THEME_OVERRIDE_DARK: u8 = 1;
 const THEME_OVERRIDE_FOLLOW: u8 = 2;
 static APP_THEME_OVERRIDE: AtomicU8 = AtomicU8::new(THEME_OVERRIDE_FOLLOW);
 
-/// Local cursor position cache (f64 stored as u64 bits).
-/// Updated in `handle_mouse_event` Move branch; read by `cursor_position()`.
-/// Replaces the former `openharmony_ability::CURSOR_POSITION_X/Y` global atomics.
-static CURSOR_X: AtomicU64 = AtomicU64::new(0);
-static CURSOR_Y: AtomicU64 = AtomicU64::new(0);
+/// Last known cursor position lives in `openharmony_ability::CURSOR_POSITION_X/Y`
+/// (vp, MainPage-relative), fed by the ArkTS `MainPage.onMouse` handler via the
+/// `update_cursor_position` NAPI function. The NDK XComponent mouse path never
+/// fires while the cursor is over the WebView (which covers the window), so it
+/// cannot be the tracking source.
 
 /// Background tokio runtime for spawning async bridge calls (fire-and-forget).
 ///
@@ -385,8 +385,9 @@ impl<T: 'static> EventLoop<T> {
 
     match mouse_event.action {
       MouseAction::Move => {
-        CURSOR_X.store((mouse_event.x as f64).to_bits(), Ordering::Relaxed);
-        CURSOR_Y.store((mouse_event.y as f64).to_bits(), Ordering::Relaxed);
+        // Cursor tracking is NOT done here: the NDK mouse callback never fires
+        // while the cursor is over the WebView. See the CURSOR_POSITION note
+        // near the top of this file.
         let position = PhysicalPosition {
           x: mouse_event.x as f64,
           y: mouse_event.y as f64,
@@ -875,8 +876,11 @@ impl<T: 'static> EventLoopWindowTarget<T> {
   }
 
   pub fn cursor_position(&self) -> Result<PhysicalPosition<f64>, error::ExternalError> {
-    let x = f64::from_bits(CURSOR_X.load(Ordering::Relaxed));
-    let y = f64::from_bits(CURSOR_Y.load(Ordering::Relaxed));
+    // Fed by the ArkTS onMouse handler (vp, MainPage-relative) — see the
+    // CURSOR_POSITION note near the top of this file. Convert vp → physical px.
+    let scale = self.app.scale() as f64;
+    let x = f64::from_bits(openharmony_ability::CURSOR_POSITION_X.load(Ordering::Relaxed)) * scale;
+    let y = f64::from_bits(openharmony_ability::CURSOR_POSITION_Y.load(Ordering::Relaxed)) * scale;
     Ok(PhysicalPosition::new(x, y))
   }
 
@@ -1978,10 +1982,14 @@ impl Window {
     // legacy synchronous `set_fullscreen` NAPI call which went through the dead
     // `get_helper()` transport.
     let on = monitor.is_some();
-    // Sync the maximized cache: fullscreen implies maximized (entering fullscreen
-    // is effectively maximize + immersive), exiting fullscreen calls recover()
-    // which un-maximizes. Without this, is_maximized() returns stale state after
-    // a fullscreen toggle, causing the next maximize/unmaximize to be a no-op.
+    // Sync the fullscreen mirror (read by `fullscreen()` for sync is_fullscreen
+    // queries; event backfill via apply_window_status corrects it if the
+    // dispatch fails). Also sync the maximized cache: fullscreen implies
+    // maximized (entering fullscreen is effectively maximize + immersive),
+    // exiting fullscreen calls recover() which un-maximizes. Without this,
+    // is_maximized() returns stale state after a fullscreen toggle, causing
+    // the next maximize/unmaximize to be a no-op.
+    self.fullscreen.store(on, Ordering::Release);
     self.maximized.store(on, Ordering::Release);
     if let Some(window_id) = self.window_id {
       let client = match &self.window_client {
@@ -2002,10 +2010,16 @@ impl Window {
 
   pub fn fullscreen(&self) -> Option<Fullscreen> {
     // OHOS fullscreen is an immersive layout mode, not a monitor-bound
-    // Fullscreen::Exclusive/Borderless(MonitorHandle) state. There is no
-    // reliable MonitorHandle to return, so report None. The actual fullscreen
-    // state is driven imperatively via `set_fullscreen` above.
-    None
+    // Fullscreen::Exclusive/Borderless(MonitorHandle) state — report the
+    // mirror bit (written by set_fullscreen and backfilled from
+    // windowStatusChange events via apply_window_status) as Borderless(None),
+    // matching upstream. Returning None unconditionally made is_fullscreen()
+    // always false, so a fullscreen toggle could enter but never exit.
+    if self.fullscreen.load(Ordering::Acquire) {
+      Some(Fullscreen::Borderless(None))
+    } else {
+      None
+    }
   }
 
   /// 回灌系统窗口状态到 tao 镜像位(问题五 5.3)。
@@ -2246,8 +2260,10 @@ impl Window {
   }
 
   pub fn cursor_position(&self) -> Result<PhysicalPosition<f64>, error::ExternalError> {
-    let x = f64::from_bits(CURSOR_X.load(Ordering::Relaxed));
-    let y = f64::from_bits(CURSOR_Y.load(Ordering::Relaxed));
+    // Same source as EventLoopWindowTarget::cursor_position — see the note there.
+    let scale = self.app.scale() as f64;
+    let x = f64::from_bits(openharmony_ability::CURSOR_POSITION_X.load(Ordering::Relaxed)) * scale;
+    let y = f64::from_bits(openharmony_ability::CURSOR_POSITION_Y.load(Ordering::Relaxed)) * scale;
     Ok(PhysicalPosition::new(x, y))
   }
 
@@ -2694,7 +2710,7 @@ mod input_tests {
   // ─── handle_mouse_event ──────────────────────────────────────────────
 
   #[test]
-  fn mouse_move_emits_cursor_moved_and_updates_cache() {
+  fn mouse_move_emits_cursor_moved() {
     let evs = run_collected(|cell| {
       EventLoop::<()>::handle_mouse_event(
         cell,
@@ -2702,8 +2718,6 @@ mod input_tests {
       );
     });
     assert_eq!(evs, vec!["CursorMoved(10.5,20.25)".to_string()]);
-    assert_eq!(f64::from_bits(CURSOR_X.load(Ordering::Relaxed)), 10.5);
-    assert_eq!(f64::from_bits(CURSOR_Y.load(Ordering::Relaxed)), 20.25);
   }
 
   #[test]
