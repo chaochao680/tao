@@ -32,11 +32,12 @@ pub(crate) use crate::icon::NoIcon as PlatformIcon;
 
 static HAS_FOCUS: AtomicBool = AtomicBool::new(true);
 
-/// App-level theme override(问题五 5.2 theme 回灌)。
-/// `set_theme(Some)` 写入显式覆盖;`set_theme(None)` 写 FOLLOW(跟随系统)。
-/// `theme()` 读此覆盖:FOLLOW 时回落到 `app.config().color_mode`(由
-/// ConfigChanged 事件持续刷新,反映系统真值,无需手动回灌)。
-/// 全局而非 per-window,因 OHOS setColorMode 本身是全局(非窗口级)。
+/// App-level theme override (issue 5, 5.2 theme backfill).
+/// `set_theme(Some)` writes an explicit override; `set_theme(None)` writes FOLLOW (follow system).
+/// `theme()` reads this override: on FOLLOW it falls back to `app.config().color_mode`
+/// (continuously refreshed by the ConfigChanged event, reflecting system truth, no
+/// manual backfill needed). Global rather than per-window, because OHOS setColorMode
+/// is itself global (not window-level).
 const THEME_OVERRIDE_LIGHT: u8 = 0;
 const THEME_OVERRIDE_DARK: u8 = 1;
 const THEME_OVERRIDE_FOLLOW: u8 = 2;
@@ -67,6 +68,11 @@ struct BridgeExecutor {
 
 impl BridgeExecutor {
     fn new() -> Self {
+        // Panics here are acceptable: this runs exactly once during EventLoop
+        // construction, before the app is functional or any recovery path
+        // exists. A failure to build the tokio runtime or spawn its driver
+        // thread leaves the bridge (and thus all async window operations)
+        // unusable, so aborting is the only sane option.
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -753,16 +759,9 @@ impl<T: 'static> EventLoop<T> {
             // thread and go through `send_user_message`'s synchronous
             // main-thread branch (direct `handle_user_message`), bypassing the
             // waker/drain path entirely.
-            let mut drained = 0u32;
             while let Ok(event) = user_events_rx.borrow_mut().try_recv() {
               let event = event::Event::UserEvent(event);
               h(event);
-              drained += 1;
-            }
-            if drained > 0 {
-              log::info!("[DRAIN-DIAG] MainEvent::UserEvent drained {} events", drained);
-            } else {
-              log::info!("[DRAIN-DIAG] MainEvent::UserEvent fired but queue empty");
             }
           }
         }
@@ -886,7 +885,7 @@ impl<T: 'static> EventLoopWindowTarget<T> {
 
   pub fn set_theme(&self, theme: Option<Theme>) {
     use openharmony_ability::ColorMode;
-    // 与 Window::set_theme 一致:写全局 override,确保 theme() 立即反映 app 意图。
+    // Mirror Window::set_theme: write the global override so theme() immediately reflects app intent.
     APP_THEME_OVERRIDE.store(
       match theme {
         Some(Theme::Dark) => THEME_OVERRIDE_DARK,
@@ -931,7 +930,7 @@ impl<T: 'static> EventLoopWindowTarget<T> {
 // (0 = main, >0 = Float sub-window) as the inner value makes per-window event
 // routing work: distinct windows hash to distinct keys. This type lives entirely
 // inside `#[cfg(target_env = "ohos")]` (platform_impl/mod.rs:29), so other
-// platforms are unaffected (铁律2).
+// platforms are unaffected (rule 2).
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub(crate) struct WindowId(i64);
 
@@ -975,7 +974,7 @@ pub enum OHOSWindowKind {
 
 static UIABILITY_CREATED: AtomicBool = AtomicBool::new(false);
 
-/// 装饰按钮位域常量（与 openharmony-ability ArkTS 一致）。
+/// Decoration button bitfield constants (aligned with openharmony-ability ArkTS).
 const FLAG_CLOSABLE: u8 = 1;
 const FLAG_MAXIMIZABLE: u8 = 2;
 const FLAG_MINIMIZABLE: u8 = 4;
@@ -1080,10 +1079,6 @@ async fn process_decor_observation(
   a.outer_h = corrected;
   a.decor_used = decor_now;
   a.rechecks_left = ACTIVE_RESIZE_RECHECKS;
-  log::info!(
-    "[tao-ohos] set_inner_size self-correct: window {} decor -> {} re-dispatch outer {}x{}",
-    window_id, decor_now, a.w, corrected
-  );
   if let Err(e) = a.client.resize_window(window_id, a.w, corrected).await {
     log::warn!("[tao-ohos] resize_window (self-correct) failed for window {}: {:?}", window_id, e);
     *active = None;
@@ -1154,10 +1149,12 @@ async fn run_decor_watch(
 pub(crate) struct Window {
   app: OpenHarmonyApp,
   window_id: Option<i64>,
-  /// 窗口种类(UIAbility/Float)。set_inner_size 的标题栏高度补偿仅对 UIAbility
-  /// 有效——app.window_rect()/content_rect() 是共享 OpenHarmonyApp 上的单一 Rect,
-  /// 只反映主窗口;Float 子窗口无系统标题栏(FloatPage 自带 UI 标题栏),套用主窗口
-  /// 的 decor_height 会错配,故 Float 跳过补偿(G7)。
+  /// Window kind (UIAbility/Float). The title-bar-height compensation in
+  /// set_inner_size only applies to UIAbility — app.window_rect()/content_rect()
+  /// is a single Rect on the shared OpenHarmonyApp, reflecting only the main
+  /// window; Float sub-windows have no system title bar (FloatPage ships its own
+  /// UI title bar), so applying the main window's decor_height would mismatch,
+  /// hence Float skips the compensation (G7).
   kind: OHOSWindowKind,
   /// Bridge facade for async window operations (None when bridge is not ready).
   window_client: Option<openharmony_ability_plugin_window::WindowClient>,
@@ -1179,30 +1176,36 @@ pub(crate) struct Window {
   /// Phase 3: whether window was created with transparent=true.
   /// Immutable after construction — set_background_color is a no-op when true.
   transparent: bool,
-  // 镜像位同步状态(问题五):
-  //   - maximized/minimized:本地镜像,set_* 写意图 + apply_window_status 事件回灌
-  //     系统真值(facade 无同步查询,镜像 + 回灌是 sync is_* 的唯一可行读源)。
-  //   - visible/fullscreen:本地镜像,由 windowStatusChange 事件回灌系统真值
-  //     (apply_window_status,wry drain 路由)。set_* 写意图、事件回灌写真值。
-  //   - decorations/decoration_flags:app-owned 本地镜像,系统无对应态可回灌
-  //     (仅记录 app 意图,关联问题四语义错位,不在本修复范围)。
-  //   - always_on_top:纯意图标志,OHOS 无 z-order API(不反映系统真实 z-order)。
-  //   - theme:已移除 per-window 字段,改读全局 APP_THEME_OVERRIDE + app.config()
-  //     colorMode(由 ConfigChanged 持续刷新)。
-  //   详见 doc/OHOS窗口遗留问题.md(问题五 5.1/5.2/5.3)。
-  /// 窗口状态镜像。visible/fullscreen 由 windowStatusChange 回灌维护。
-  /// 默认 visible=true，fullscreen=false。
+  // Mirror-bit sync state (issue 5):
+  //   - maximized/minimized: local mirror, set_* writes intent + apply_window_status
+  //     backfills system truth (the facade has no sync query; mirror + backfill is
+  //     the only viable read source for sync is_*).
+  //   - visible/fullscreen: local mirror, backfilled by windowStatusChange events
+  //     (apply_window_status, wry drain route). set_* writes intent, events write truth.
+  //   - decorations/decoration_flags: app-owned local mirror, no system state to
+  //     backfill (records app intent only; related to issue 4 semantic mismatch,
+  //     out of scope for this fix).
+  //   - always_on_top: pure intent flag, OHOS has no z-order API (does not reflect
+  //     the real system z-order).
+  //   - theme: per-window field removed, now reads global APP_THEME_OVERRIDE +
+  //     app.config() colorMode (continuously refreshed by ConfigChanged).
+  //   See doc/OHOS-window-residual-issues.md (issue 5, 5.1/5.2/5.3).
+  /// Window state mirror. visible/fullscreen are maintained by windowStatusChange backfill.
+  /// Defaults: visible=true, fullscreen=false.
   visible: AtomicBool,
   fullscreen: AtomicBool,
-  /// always_on_top 意图标志（OHOS 无直接 API，仅记录意图，见 set_always_on_top）。
+  /// always_on_top intent flag (OHOS has no direct API; records intent only, see set_always_on_top).
   always_on_top: AtomicBool,
-  /// 装饰按钮可用性位域。bit0 closable, bit1 maximizable, bit2 minimizable,
-  /// bit3 resizable。默认 0b1111=15（全可用）。
+  /// Decoration button availability bitfield. bit0 closable, bit1 maximizable,
+  /// bit2 minimizable, bit3 resizable. Defaults to 0b1111=15 (all enabled).
   decoration_flags: AtomicU8,
-  /// 窗口尺寸约束缓存(min/max w/h,px)。OHOS `setWindowLimits` 一次性写四值
-  /// (0=无限制),非增量;故 `set_min_inner_size`/`set_max_inner_size` 必须把两套
-  /// 约束一起下发,否则后调者会把另一维度重置为 0(丢约束)。两个 setter 各自更新
-  /// 自己的缓存位,再读对方缓存,四值同下。AtomicU32 因 setter 可从任意线程调用。
+  /// Window size constraint cache (min/max w/h, px). OHOS `setWindowLimits`
+  /// writes all four values at once (0 = unlimited), non-incrementally; so
+  /// `set_min_inner_size`/`set_max_inner_size` must send both constraint sets
+  /// together, otherwise the later call resets the other dimension to 0 (losing
+  /// the constraint). Each setter updates its own cache slots, then reads the
+  /// other's cache and sends all four. AtomicU32 because setters may be called
+  /// from any thread.
   min_inner_width: AtomicU32,
   min_inner_height: AtomicU32,
   max_inner_width: AtomicU32,
@@ -1226,8 +1229,8 @@ enum OHOSWindowType {
 /// `window.on('windowStatusChange')`. Values match the ArkTS enum order:
 /// 1=FULL_SCREEN, 2=MAXIMIZE, 3=MINIMIZE, 4=FLOATING, 5=SPLIT_SCREEN.
 ///
-/// Used by [`Window::apply_window_status`] to回灌 system truth into tao mirror
-/// bits. See doc/OHOS窗口遗留问题.md(问题五 5.3).
+/// Used by [`Window::apply_window_status`] to backfill system truth into tao mirror
+/// bits. See doc/OHOS-window-residual-issues.md (issue 5, 5.3).
 enum WindowStatus {
   FullScreen,
   Maximize,
@@ -1392,7 +1395,6 @@ impl Window {
         }
       }
     };
-    log::info!("[tao DBG] Window::new: window_id = {:?}", window_id);
 
     // Create the WindowClient bridge facade. If the bridge runtime is not yet
     // ready (e.g. during early init), window_client = None and all window
@@ -1485,8 +1487,8 @@ impl Window {
     // = window position + system title-bar offset + content offset within container.
     // content_rect.left/top is XComponent offset relative to its parent container,
     // which already sits BELOW the system title bar — the title bar height is not
-    // included. Add decor_height, mirroring set_inner_size's compensation (遗留问题二
-    // getter 侧): without this, innerPosition == outerPosition on decorated windows
+    // included. Add decor_height, mirroring set_inner_size's compensation (issue 2
+    // getter side): without this, innerPosition == outerPosition on decorated windows
     // (observed 2026-08-20: inner (515,451) == outer (515,451) with a 146px title
     // bar; true content origin is (515,597)).
     // Float sub-windows have no system title bar (FloatPage ships its own UI bar):
@@ -1541,7 +1543,7 @@ impl Window {
   }
 
   pub fn set_inner_size(&self, size: Size) {
-    // 拦截:FLAG_RESIZABLE 为 0 时,不允许 resize(问题四:语义错位修复)
+    // Guard: when FLAG_RESIZABLE is 0, disallow resize (issue 4: semantic mismatch fix)
     if (self.decoration_flags.load(Ordering::Acquire) & FLAG_RESIZABLE) == 0 {
       log::warn!("[tao-ohos] set_inner_size blocked: FLAG_RESIZABLE not set");
       return;
@@ -1551,7 +1553,7 @@ impl Window {
     // decor_height = main-window title bar inset (cached, latched on surface
     // events — see app.rs latch_decor_height).
     // Without this, save→restore loops shrink the window by one title bar each cycle
-    // (遗留问题二: inner/outer 语义错位). Width is NOT compensated (title bar only
+    // (issue 2: inner/outer semantic mismatch). Width is NOT compensated (title bar only
     // affects height).
     //
     // G7: content_rect() reads a single Rect on the shared OpenHarmonyApp that
@@ -1862,11 +1864,13 @@ impl Window {
     self.always_on_top.load(Ordering::Acquire)
   }
 
-  // TODO(遗留问题四): set_resizable/set_minimizable/set_maximizable/set_closable
-  //   名义控制"窗口能否 resize/最小化/最大化/关闭",实际 set_decoration_flag 只改
-  //   装饰按钮显隐(FloatPage @LocalStorageProp),不拦截 set_minimized/set_maximized/
-  //   close/set_inner_size 等编程式 API。is_resizable 等也从本地镜像读,返回假承诺。
-  //   主窗口完全 no-op。详见 doc/OHOS窗口遗留问题.md(问题四)。
+  // TODO(issue 4): set_resizable/set_minimizable/set_maximizable/set_closable
+  //   nominally control "whether the window can resize/minimize/maximize/close",
+  //   but set_decoration_flag only toggles decoration button visibility
+  //   (FloatPage @LocalStorageProp); it does not block programmatic APIs like
+  //   set_minimized/set_maximized/close/set_inner_size. is_resizable etc. also read
+  //   from the local mirror, returning a false promise. The main window is a
+  //   complete no-op. See doc/OHOS-window-residual-issues.md (issue 4).
   pub fn set_resizable(&self, resizable: bool) {
     self.set_decoration_flag(FLAG_RESIZABLE, resizable);
   }
@@ -1883,10 +1887,11 @@ impl Window {
     self.set_decoration_flag(FLAG_CLOSABLE, closable);
   }
 
-  /// 公共：更新一个装饰位并派发到 ArkTS（FloatPage LocalStorage）。
-  /// 经 window bridge facade fire-and-forget（set-decorations 携带 flags 的
-  /// 变体不存在——ArkTS 侧 WindowManager.setDecorationFlag 拦截读该位域；
-  /// 此处仅写本地镜像 + 日志，派发走 set_window_decoration_flags 等价 action）。
+  /// Common helper: update one decoration bit and dispatch to ArkTS (FloatPage LocalStorage).
+  /// Dispatched via the window bridge facade fire-and-forget (no `set-decorations`
+  /// variant carrying flags exists — the ArkTS WindowManager.setDecorationFlag
+  /// intercepts by reading this bitfield; here we only write the local mirror +
+  /// log, dispatching via the equivalent `set_window_decoration_flags` action).
   fn set_decoration_flag(&self, flag: u8, on: bool) {
     let mut flags = self.decoration_flags.load(Ordering::Acquire);
     if on { flags |= flag; } else { flags &= !flag; }
@@ -1905,7 +1910,7 @@ impl Window {
   }
 
   pub fn set_minimized(&self, minimized: bool) {
-    // 拦截:FLAG_MINIMIZABLE 为 0 时,不允许最小化(问题四:语义错位修复)
+    // Guard: when FLAG_MINIMIZABLE is 0, disallow minimize (issue 4: semantic mismatch fix)
     if minimized && (self.decoration_flags.load(Ordering::Acquire) & FLAG_MINIMIZABLE) == 0 {
       log::warn!("[tao-ohos] set_minimized(true) blocked: FLAG_MINIMIZABLE not set");
       return;
@@ -1939,7 +1944,7 @@ impl Window {
   }
 
   pub fn set_maximized(&self, maximized: bool) {
-    // 拦截:FLAG_MAXIMIZABLE 为 0 时,不允许最大化(问题四:语义错位修复)
+    // Guard: when FLAG_MAXIMIZABLE is 0, disallow maximize (issue 4: semantic mismatch fix)
     if maximized && (self.decoration_flags.load(Ordering::Acquire) & FLAG_MAXIMIZABLE) == 0 {
       log::warn!("[tao-ohos] set_maximized(true) blocked: FLAG_MAXIMIZABLE not set");
       return;
@@ -2022,56 +2027,59 @@ impl Window {
     }
   }
 
-  /// 回灌系统窗口状态到 tao 镜像位(问题五 5.3)。
+  /// Backfills system window status into tao mirror bits (issue 5, 5.3).
   ///
-  /// 由 tauri-runtime-wry 的 OHOS drain 块调用:`windowStatusChange` 事件经
-  /// `notify_window_status` NAPI 入队,drain 后用真实 OHOS windowId 路由到此
-  /// `Window`,把系统真值写入镜像位。
+  /// Called by tauri-runtime-wry's OHOS drain block: the `windowStatusChange`
+  /// event is enqueued via the `notify_window_status` NAPI, then after draining
+  /// it is routed to this `Window` by the real OHOS windowId, writing the system
+  /// truth into the mirror bits.
   ///
-  /// `maximized`/`minimized` 同样走镜像回灌:bridge facade 无同步系统查询
-  /// (上游旧框架的 `getWindowStatus()` sync NAPI 已随 ArkHelper 通道删除),
-  /// 事件回灌 + setter 意图写是 sync `is_maximized()`/`is_minimized()` 唯一
-  /// 可行的读源。
+  /// `maximized`/`minimized` are likewise backfilled via the mirror: the bridge
+  /// facade has no synchronous system query (the old framework's `getWindowStatus()`
+  /// sync NAPI was removed with the ArkHelper channel), so event backfill +
+  /// setter intent writes are the only viable read source for sync
+  /// `is_maximized()`/`is_minimized()`.
   ///
-  /// `status` 是裸 OHOS `WindowStatusType` 值(透传自 ArkTS)。
+  /// `status` is a raw OHOS `WindowStatusType` value (passed through from ArkTS).
   pub fn apply_window_status(&self, status: i32) {
     match WindowStatus::from(status) {
       WindowStatus::FullScreen => {
-        // 系统全屏态:可见 + 全屏 + 最大化(tauri 全屏进入路径同步过镜像)。
+        // System fullscreen: visible + fullscreen + maximized (tauri's fullscreen entry path mirrors this synchronously).
         self.visible.store(true, Ordering::Release);
         self.fullscreen.store(true, Ordering::Release);
         self.maximized.store(true, Ordering::Release);
         self.minimized.store(false, Ordering::Release);
       }
       WindowStatus::Maximize => {
-        // 最大化:可见、非全屏、非最小化。
+        // Maximize: visible, not fullscreen, not minimized.
         self.visible.store(true, Ordering::Release);
         self.fullscreen.store(false, Ordering::Release);
         self.maximized.store(true, Ordering::Release);
         self.minimized.store(false, Ordering::Release);
       }
       WindowStatus::Minimize => {
-        // 最小化:不可见、非全屏、非最大化。
+        // Minimize: not visible, not fullscreen, not maximized.
         self.visible.store(false, Ordering::Release);
         self.fullscreen.store(false, Ordering::Release);
         self.maximized.store(false, Ordering::Release);
         self.minimized.store(true, Ordering::Release);
       }
       WindowStatus::Floating => {
-        // 自由悬浮(常态):可见、非全屏、非最大化、非最小化。
+        // Free floating (normal): visible, not fullscreen, not maximized, not minimized.
         self.visible.store(true, Ordering::Release);
         self.fullscreen.store(false, Ordering::Release);
         self.maximized.store(false, Ordering::Release);
         self.minimized.store(false, Ordering::Release);
       }
       WindowStatus::SplitScreen => {
-        // 分屏:可见、非全屏(tao 无分屏概念,按可见处理);maximized 保持
-        // 不动——分屏半屏既非最大化也非悬浮,无法可靠推断。
+        // Split screen: visible, not fullscreen (tao has no split-screen concept,
+        // treat as visible); maximized left untouched — a split half is neither
+        // maximized nor floating, cannot be reliably inferred.
         self.visible.store(true, Ordering::Release);
         self.fullscreen.store(false, Ordering::Release);
       }
       WindowStatus::Other => {
-        // UNDEFINED/未知值:不改,避免误清。
+        // UNDEFINED/unknown value: don't change anything, avoid accidental clearing.
       }
     }
   }
@@ -2111,9 +2119,12 @@ impl Window {
     }
   }
   pub fn set_ime_position(&self, position: Position) {
-    // IME 位置:转物理像素后透传给 ArkTS inputMethod.getController().updateCursor(CursorInfo)。
-    // 前置:窗口内有已聚焦的编辑框(HTML input 亦可),否则报 12800009 client detached(正常)。
-    // 聚焦 HTML input 后实测 OK(2026-08-19)— webview 场景可用,非架构限制。
+    // IME position: convert to physical pixels and forward to ArkTS
+    // inputMethod.getController().updateCursor(CursorInfo).
+    // Prerequisite: a focused edit field inside the window (an HTML input works),
+    // otherwise error 12800009 client detached is returned (expected/normal).
+    // Verified OK after focusing an HTML input (2026-08-19) — works for the
+    // webview scenario, not an architectural limitation.
     let p = position.to_physical::<i32>(self.scale_factor());
     if let Some(window_id) = self.window_id {
       let client = match &self.window_client {
@@ -2157,11 +2168,12 @@ impl Window {
   pub fn set_window_icon(&self, _window_icon: Option<crate::icon::Icon>) {}
 
   pub fn set_cursor_icon(&self, icon: window::CursorIcon) {
-    // TODO(遗留问题六): 已 dispatch 但未经真机测试 — 需验证 style 映射覆盖、
-    //   触摸态设备行为、Float 子窗口是否生效。见 doc/OHOS窗口遗留问题.md(问题六)。
-    // 按 windowId 设置光标样式(pointer.setPointerStyleSync),经 window bridge
-    // facade fire-and-forget 派发(ArkTS 侧委托 WindowManager.setPointerStyle,
-    // 已用真实 OHOS window id)。
+    // TODO(issue 6): dispatched but not yet device-tested — verify style mapping
+    //   coverage, touch-mode device behavior, and whether it works on Float
+    //   sub-windows. See doc/OHOS-window-residual-issues.md (issue 6).
+    // Set cursor style by windowId (pointer.setPointerStyleSync), dispatched via
+    // the window bridge facade fire-and-forget (ArkTS side delegates to
+    // WindowManager.setPointerStyle, using the real OHOS window id).
     let style = ohos_pointer_style(icon);
     if let Some(window_id) = self.window_id {
       let client = match &self.window_client {
@@ -2302,11 +2314,14 @@ impl Window {
   }
 
   pub fn set_cursor_visible(&self, visible: bool) {
-    // TODO(遗留问题六): 已 dispatch 但未经真机测试 — 需验证作用域(全局 vs 窗口级):
-    //   pointer.setPointerVisible 是全局光标显隐,tao 语义是窗口级,多窗口下会连带影响其他窗口。
-    //   见 doc/OHOS窗口遗留问题.md(问题六)。
-    // 全局光标显隐（pointer.setPointerVisible）,经 window bridge facade
-    // fire-and-forget 派发(ArkTS 侧委托 WindowManager.setPointerVisible)。
+    // TODO(issue 6): dispatched but not yet device-tested — verify scope (global vs
+    //   window-level): pointer.setPointerVisible is a global cursor toggle, while
+    //   tao's semantics are window-level; under multiple windows it would also
+    //   affect other windows.
+    //   See doc/OHOS-window-residual-issues.md (issue 6).
+    // Global cursor visibility (pointer.setPointerVisible), dispatched via the
+    // window bridge facade fire-and-forget (ArkTS side delegates to
+    // WindowManager.setPointerVisible).
     // Restores the dispatch that the bridge facade migration dropped to a
     // no-op — the ArkTS implementation survived, only the Rust call was lost.
     let client = match &self.window_client {
@@ -2387,18 +2402,19 @@ impl Window {
   }
 
   pub fn theme(&self) -> Theme {
-    // 问题五 5.2 theme 回灌:读全局 override;FOLLOW 时回落到 app.config()。
-    // app.config().color_mode 由 ConfigChanged(onConfigurationUpdated)持续刷新,
-    // 反映系统真值——故 FOLLOW 模式下无需手动回灌即与系统同步。
+    // Issue 5, 5.2 theme backfill: read the global override; on FOLLOW fall back to app.config().
+    // app.config().color_mode is continuously refreshed by ConfigChanged
+    // (onConfigurationUpdated), reflecting system truth — so under FOLLOW mode it
+    // stays in sync with the system without manual backfill.
     use openharmony_ability::ColorMode;
     match APP_THEME_OVERRIDE.load(Ordering::Relaxed) {
       THEME_OVERRIDE_DARK => Theme::Dark,
       THEME_OVERRIDE_LIGHT => Theme::Light,
       _ => {
-        // FOLLOW:读系统真值。
+        // FOLLOW: read system truth.
         match self.app.config().color_mode {
           ColorMode::Dark => Theme::Dark,
-          // Light 或 NoSet(启动前未收到 ConfigChanged)→ Light。
+          // Light or NoSet (no ConfigChanged received before startup) → Light.
           _ => Theme::Light,
         }
       }
@@ -2407,7 +2423,7 @@ impl Window {
 
   pub fn set_theme(&self, theme: Option<Theme>) {
     use openharmony_ability::ColorMode;
-    // 写 override:Some → 显式覆盖;None → FOLLOW(跟随系统)。
+    // Write override: Some → explicit override; None → FOLLOW (follow system).
     APP_THEME_OVERRIDE.store(
       match theme {
         Some(Theme::Dark) => THEME_OVERRIDE_DARK,
@@ -3072,7 +3088,7 @@ mod input_tests {
   }
 }
 
-// ─── S9 fmt 批：OsError Display（文件尾追加，不移动既有行号） ────────────────────
+// --- S9 fmt batch: OsError Display (appended at file end, keeps existing line numbers) ---
 #[cfg(test)]
 mod fmt_tests {
   use super::OsError;
